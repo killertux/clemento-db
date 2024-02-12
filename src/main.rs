@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
         let result = query_executor(ast).await?;
         for statement_result in result.into_iter() {
             for line in statement_result.into_iter() {
-                println!("{}", line.join("\t"));
+                println!("{}", line.join(";"));
             }
             println!();
         }
