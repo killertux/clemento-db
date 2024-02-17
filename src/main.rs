@@ -2,13 +2,12 @@ use anyhow::{anyhow, bail, Result};
 use bigdecimal::{BigDecimal, ToPrimitive};
 use indexmap::IndexMap;
 use sqlparser::ast::{
-    BinaryOperator, DataType, Expr, Select, SelectItem, SetExpr, Statement, TableFactor,
-    Value as AstValue,
+    BinaryOperator, DataType, Expr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr,
+    Statement, TableFactor, Value as AstValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::future::Future;
-use std::vec;
 use tokio::fs::File;
 use tokio::io::{stdin, AsyncBufReadExt, AsyncRead, BufReader};
 
@@ -63,7 +62,7 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
             SetExpr::Select(select) => {
                 let execution_plan = select_plan(*select.clone())?;
                 let mut data = Vec::new();
-                let mut data_columns = IndexSet::new();
+                // let mut data_columns = IndexSet::new();
                 for table in execution_plan.tables {
                     let rows = match table.fetch {
                         Fetch::FullScan => {
@@ -76,10 +75,10 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
                             let mut rows: Vec<IndexMap<String, String>> = Vec::new();
                             while let Some(line) = lines.next_line().await? {
                                 rows.push(
-                                    line.trim()
-                                        .split('\t')
-                                        .map(|value| value.into())
-                                        .zip(header.iter().map(|value| (*value).into()))
+                                    header
+                                        .iter()
+                                        .map(|value| (*value).into())
+                                        .zip(line.trim().split('\t').map(|value| value.into()))
                                         .collect(),
                                 );
                             }
@@ -133,8 +132,25 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
                         _ => bail!("Unimplemented for {projection}"),
                     }
                 }
+                statement_result.push(
+                    projections
+                        .iter()
+                        .map(|(_, alias)| alias.clone())
+                        .collect::<Vec<String>>(),
+                );
                 for row in data.into_iter() {
-
+                    if evaluate_expression(&row, &execution_plan.filters)?.to_bool() {
+                        statement_result.push(
+                            projections
+                                .iter()
+                                .map(|(field, _)| {
+                                    row.get(field)
+                                        .ok_or(anyhow!("Field {field} not found in data"))
+                                        .cloned()
+                                })
+                                .collect::<Result<Vec<String>>>()?,
+                        );
+                    }
                 }
                 // statement_result.push(header_result);
                 // let mut lines = reader.lines();
@@ -160,14 +176,13 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
     Ok(statement_result)
 }
 
-fn evaluate_expression(header: &[&str], fields: &[&str], expression: &Expr) -> Result<Value> {
+fn evaluate_expression(row: &IndexMap<String, String>, expression: &Expr) -> Result<Value> {
     Ok(match expression {
         Expr::Identifier(identifier) => {
-            let pos = header
-                .iter()
-                .position(|column| *column == identifier.value)
+            let value = row
+                .get(&identifier.value)
                 .ok_or(anyhow!("Failed to find column {identifier}"))?;
-            Value::String(fields[pos].to_string())
+            Value::String(value.clone())
         }
         Expr::Value(value) => match value {
             AstValue::Boolean(value) => (*value).into(),
@@ -188,26 +203,22 @@ fn evaluate_expression(header: &[&str], fields: &[&str], expression: &Expr) -> R
             }
             _ => bail!("Not implemented value {value}"),
         },
-        Expr::IsFalse(expr) => (!evaluate_expression(header, fields, expr)?.to_bool()).into(),
-        Expr::IsNotFalse(expr) => evaluate_expression(header, fields, expr)?.to_bool().into(),
-        Expr::IsTrue(expr) => evaluate_expression(header, fields, expr)?.to_bool().into(),
-        Expr::IsNotTrue(expr) => (!evaluate_expression(header, fields, expr)?.to_bool()).into(),
-        Expr::IsNull(expr) => {
-            matches!(evaluate_expression(header, fields, expr)?, Value::Null).into()
-        }
-        Expr::IsNotNull(expr) => {
-            (!matches!(evaluate_expression(header, fields, expr)?, Value::Null)).into()
-        }
+        Expr::IsFalse(expr) => (!evaluate_expression(row, expr)?.to_bool()).into(),
+        Expr::IsNotFalse(expr) => evaluate_expression(row, expr)?.to_bool().into(),
+        Expr::IsTrue(expr) => evaluate_expression(row, expr)?.to_bool().into(),
+        Expr::IsNotTrue(expr) => (!evaluate_expression(row, expr)?.to_bool()).into(),
+        Expr::IsNull(expr) => matches!(evaluate_expression(row, expr)?, Value::Null).into(),
+        Expr::IsNotNull(expr) => (!matches!(evaluate_expression(row, expr)?, Value::Null)).into(),
         Expr::BinaryOp { left, op, right } => {
-            let left = evaluate_expression(header, fields, left)?;
+            let left = evaluate_expression(row, left)?;
             match op {
                 BinaryOperator::And => {
-                    (left.to_bool() && evaluate_expression(header, fields, right)?.to_bool()).into()
+                    (left.to_bool() && evaluate_expression(row, right)?.to_bool()).into()
                 }
                 BinaryOperator::Or => {
-                    (left.to_bool() || evaluate_expression(header, fields, right)?.to_bool()).into()
+                    (left.to_bool() || evaluate_expression(row, right)?.to_bool()).into()
                 }
-                BinaryOperator::Eq => (left == evaluate_expression(header, fields, right)?).into(),
+                BinaryOperator::Eq => (left == evaluate_expression(row, right)?).into(),
                 _ => bail!("Not implemented operator {op}"),
             }
         }
@@ -219,13 +230,14 @@ fn evaluate_expression(header: &[&str], fields: &[&str], expression: &Expr) -> R
             if format.is_some() {
                 bail!("Cannot format in casts");
             }
-            let value = evaluate_expression(header, fields, expr)?;
+            let value = evaluate_expression(row, expr)?;
             match (&value, data_type) {
                 (Value::Integer(value), DataType::Text) => Value::String(value.to_string()),
+                (Value::String(value), DataType::Integer(_)) => Value::Integer(value.parse()?),
                 _ => bail!("Cannot cast {value:?} into {data_type}"),
             }
         }
-        _ => bail!("Not implemented expresion {expression}"),
+        _ => bail!("Not implemented expression {expression:?}"),
     })
 }
 
@@ -274,8 +286,40 @@ fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
         bail!("Can only process selects with one table");
     }
     let table = select.from.remove(0);
-    if !table.joins.is_empty() {
-        bail!("Cannot process joins");
+    let mut execution_plan_tables = Vec::new();
+    let mut filters = select
+        .selection
+        .unwrap_or(Expr::Value(AstValue::Boolean(true)));
+    for join in table.joins {
+        let TableFactor::Table {
+            name,
+            alias: _,
+            args: _,
+            with_hints: _,
+            version: _,
+            partitions: _,
+        } = join.relation
+        else {
+            bail!("Can only process Tables. {} given.", table.relation)
+        };
+        execution_plan_tables.push(TableFetch {
+            fetch: Fetch::FullScan,
+            table: name.to_string(),
+        });
+        let JoinOperator::Inner(constraint) = join.join_operator else {
+            bail!("Cannot process join {:?}", join.join_operator)
+        };
+        match constraint {
+            JoinConstraint::None => {}
+            JoinConstraint::On(expr) => {
+                filters = Expr::BinaryOp {
+                    left: Box::new(filters),
+                    right: Box::new(expr),
+                    op: BinaryOperator::And,
+                }
+            }
+            _ => bail!("Unimplemented join constraint {constraint:?}"),
+        }
     }
     let TableFactor::Table {
         name,
@@ -288,18 +332,19 @@ fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
     else {
         bail!("Can only process Tables. {} given.", table.relation)
     };
-    return Ok(ExecutionPlan {
-        tables: vec![TableFetch {
-            fetch: Fetch::FullScan,
-            table: name.to_string(),
-        }],
-        filters: select.selection,
+    execution_plan_tables.push(TableFetch {
+        fetch: Fetch::FullScan,
+        table: name.to_string(),
     });
+    Ok(ExecutionPlan {
+        tables: execution_plan_tables,
+        filters,
+    })
 }
 
 pub struct ExecutionPlan {
     tables: Vec<TableFetch>,
-    filters: Option<Expr>,
+    filters: Expr,
 }
 
 pub struct TableFetch {
