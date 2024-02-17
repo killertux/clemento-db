@@ -1,11 +1,14 @@
 use anyhow::{anyhow, bail, Result};
 use bigdecimal::{BigDecimal, ToPrimitive};
+use indexmap::IndexMap;
 use sqlparser::ast::{
-    BinaryOperator, DataType, Expr, SelectItem, SetExpr, Statement, TableFactor, Value as AstValue,
+    BinaryOperator, DataType, Expr, Select, SelectItem, SetExpr, Statement, TableFactor,
+    Value as AstValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::future::Future;
+use std::vec;
 use tokio::fs::File;
 use tokio::io::{stdin, AsyncBufReadExt, AsyncRead, BufReader};
 
@@ -57,84 +60,98 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
     let mut statement_result = Vec::new();
     match statement {
         Statement::Query(query) => match *query.body {
-            SetExpr::Select(mut select) => {
-                if select.from.len() != 1 {
-                    bail!("Can only process selects with one table");
+            SetExpr::Select(select) => {
+                let execution_plan = select_plan(*select.clone())?;
+                let mut data = Vec::new();
+                let mut data_columns = IndexSet::new();
+                for table in execution_plan.tables {
+                    let rows = match table.fetch {
+                        Fetch::FullScan => {
+                            let file = File::open(format!("{}.tsv", table.table)).await?;
+                            let mut reader = BufReader::new(file);
+                            let mut header = String::new();
+                            reader.read_line(&mut header).await?;
+                            let header: Vec<&str> = header.trim().split('\t').collect();
+                            let mut lines = reader.lines();
+                            let mut rows: Vec<IndexMap<String, String>> = Vec::new();
+                            while let Some(line) = lines.next_line().await? {
+                                rows.push(
+                                    line.trim()
+                                        .split('\t')
+                                        .map(|value| value.into())
+                                        .zip(header.iter().map(|value| (*value).into()))
+                                        .collect(),
+                                );
+                            }
+                            rows
+                        }
+                    };
+                    if data.is_empty() {
+                        data = rows;
+                    } else {
+                        data = data
+                            .into_iter()
+                            .flat_map(|exisent_row| {
+                                rows.iter().map(move |new_row| {
+                                    exisent_row
+                                        .iter()
+                                        .chain(new_row.iter())
+                                        .map(|(index, value)| {
+                                            (index.to_string(), value.to_string())
+                                        })
+                                        .collect::<IndexMap<String, String>>()
+                                })
+                            })
+                            .collect();
+                    }
                 }
-                let table = select.from.remove(0);
-                if !table.joins.is_empty() {
-                    bail!("Cannot process joins");
-                }
-                let TableFactor::Table {
-                    name,
-                    alias: _,
-                    args: _,
-                    with_hints: _,
-                    version: _,
-                    partitions: _,
-                } = table.relation
-                else {
-                    bail!("Can only process Tables. {} given.", table.relation)
-                };
-                let file = File::open(format!("{name}.tsv")).await?;
-                let mut reader = BufReader::new(file);
-                let mut header = String::new();
-                reader.read_line(&mut header).await?;
-                let header: Vec<&str> = header.trim().split('\t').collect();
-                let mut projections_indexes: Vec<usize> = Vec::new();
-                let mut header_result = Vec::new();
+                let mut projections: Vec<(String, String)> = Vec::new();
                 for projection in select.projection {
                     match projection {
                         SelectItem::Wildcard(_) => {
-                            projections_indexes.append(&mut (0..header.len()).collect());
-                            header_result.append(
-                                &mut projections_indexes
-                                    .iter()
-                                    .map(|pos| header[*pos].to_string())
-                                    .collect(),
-                            );
+                            projections
+                                .extend(data[0].keys().map(|key| (key.clone(), key.clone())));
                         }
                         SelectItem::UnnamedExpr(expr) => {
                             let Expr::Identifier(ident) = expr else {
                                 bail!("Can only project identifiers. {expr} given")
                             };
-                            let pos = header
-                                .iter()
-                                .position(|column| *column == ident.value)
-                                .ok_or(anyhow!("Cannot find column {ident}"))?;
-                            projections_indexes.push(pos);
-                            header_result.push(ident.value);
+                            if !data[0].contains_key(&ident.value) {
+                                bail!("Column {} not found", ident.value)
+                            }
+                            projections.push((ident.value.clone(), ident.value));
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
                             let Expr::Identifier(ident) = expr else {
                                 bail!("Can only project identifiers. {expr} given")
                             };
-                            let pos = header
-                                .iter()
-                                .position(|column| *column == ident.value)
-                                .ok_or(anyhow!("Cannot find column {ident}"))?;
-                            projections_indexes.push(pos);
-                            header_result.push(alias.value);
+                            if !data[0].contains_key(&ident.value) {
+                                bail!("Column {} not found", ident.value)
+                            }
+                            projections.push((ident.value, alias.value));
                         }
                         _ => bail!("Unimplemented for {projection}"),
                     }
                 }
-                statement_result.push(header_result);
-                let mut lines = reader.lines();
-                while let Some(line) = lines.next_line().await? {
-                    let fields: Vec<&str> = line.trim().split('\t').collect();
-                    if match &select.selection {
-                        None => true,
-                        Some(expr) => evaluate_expression(&header, &fields, expr)?.to_bool(),
-                    } {
-                        statement_result.push(
-                            projections_indexes
-                                .iter()
-                                .map(|pos| fields[*pos].to_string())
-                                .collect(),
-                        );
-                    }
+                for row in data.into_iter() {
+
                 }
+                // statement_result.push(header_result);
+                // let mut lines = reader.lines();
+                // while let Some(line) = lines.next_line().await? {
+                //     let fields: Vec<&str> = line.trim().split('\t').collect();
+                //     if match &select.selection {
+                //         None => true,
+                //         Some(expr) => evaluate_expression(&header, &fields, expr)?.to_bool(),
+                //     } {
+                //         statement_result.push(
+                //             projections_indexes
+                //                 .iter()
+                //                 .map(|pos| fields[*pos].to_string())
+                //                 .collect(),
+                //         );
+                //     }
+                // }
             }
             _ => bail!("Unimplemented for {}", query.body),
         },
@@ -250,4 +267,46 @@ impl Value {
             Value::Null => false,
         }
     }
+}
+
+fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
+    if select.from.len() != 1 {
+        bail!("Can only process selects with one table");
+    }
+    let table = select.from.remove(0);
+    if !table.joins.is_empty() {
+        bail!("Cannot process joins");
+    }
+    let TableFactor::Table {
+        name,
+        alias: _,
+        args: _,
+        with_hints: _,
+        version: _,
+        partitions: _,
+    } = table.relation
+    else {
+        bail!("Can only process Tables. {} given.", table.relation)
+    };
+    return Ok(ExecutionPlan {
+        tables: vec![TableFetch {
+            fetch: Fetch::FullScan,
+            table: name.to_string(),
+        }],
+        filters: select.selection,
+    });
+}
+
+pub struct ExecutionPlan {
+    tables: Vec<TableFetch>,
+    filters: Option<Expr>,
+}
+
+pub struct TableFetch {
+    fetch: Fetch,
+    table: String,
+}
+
+pub enum Fetch {
+    FullScan,
 }
