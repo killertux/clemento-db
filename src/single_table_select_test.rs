@@ -100,14 +100,7 @@ async fn select_casting_field() -> Result<()> {
 
 #[tokio::test]
 async fn select_casting_literal() -> Result<()> {
-    let table_storage = InMemoryTableStorage::new(";").add_table(
-        "test",
-        r#"id;field1;field2
-1;First Name;1001
-2;Second Name;2002
-3;Third Name;1001
-"#,
-    );
+    let table_storage = build_table_storage_for_test();
     let result = process_statement(
         "SELECT * FROM test WHERE field2 = CAST(2002 as Text);",
         &table_storage,
@@ -116,6 +109,43 @@ async fn select_casting_literal() -> Result<()> {
     assert_eq!(
         vec![
             vec!["id", "field1", "field2"],
+            vec!["2", "Second Name", "2002"],
+        ],
+        result
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn select_and() -> Result<()> {
+    let table_storage = build_table_storage_for_test();
+    let result = process_statement(
+        "SELECT * FROM test WHERE field1 = 'First Name' AND field2 = '1001';",
+        &table_storage,
+    )
+    .await?;
+    assert_eq!(
+        vec![
+            vec!["id", "field1", "field2"],
+            vec!["1", "First Name", "1001"],
+        ],
+        result
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn select_or() -> Result<()> {
+    let table_storage = build_table_storage_for_test();
+    let result = process_statement(
+        "SELECT * FROM test WHERE id = '1' OR id = '2';",
+        &table_storage,
+    )
+    .await?;
+    assert_eq!(
+        vec![
+            vec!["id", "field1", "field2"],
+            vec!["1", "First Name", "1001"],
             vec!["2", "Second Name", "2002"],
         ],
         result
