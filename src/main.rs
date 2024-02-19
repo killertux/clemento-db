@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Result};
+use async_stream::stream;
 use bigdecimal::{BigDecimal, ToPrimitive};
+use futures_util::{pin_mut, Stream, StreamExt};
 use indexmap::IndexMap;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr,
@@ -7,55 +9,63 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use std::future::Future;
 use tokio::fs::File;
-use tokio::io::{stdin, AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{stdin, AsyncBufRead, AsyncBufReadExt, AsyncRead, BufReader};
+
+#[cfg(test)]
+mod single_table_select_test;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let dialect = GenericDialect {};
-    process_sql(stdin(), &dialect, |ast| async {
-        for statement in ast.into_iter() {
-            let result = query_executor(statement).await?;
-            for line in result.into_iter() {
-                println!("{}", line.join(";"));
-            }
-            println!();
+    let table_storage = LocalDiskTableStorage::new("\t");
+    let statements = process_sql(stdin(), &dialect).await;
+    pin_mut!(statements);
+    while let Some(statement) = statements.next().await {
+        let statement = statement?;
+        let result = query_executor(statement, &table_storage).await?;
+        for line in result.into_iter() {
+            println!("{}", line.join(";"));
         }
-        Ok(())
-    })
-    .await?;
-
-    Ok(())
-}
-
-async fn process_sql<R, F, Fut>(stdin: R, dialect: &GenericDialect, mut processor: F) -> Result<()>
-where
-    R: AsyncRead + Unpin,
-    F: FnMut(Vec<Statement>) -> Fut,
-    Fut: Future<Output = Result<()>>,
-{
-    let stdin = BufReader::new(stdin);
-    let mut buffer = String::new();
-    let mut lines = stdin.lines();
-    while let Some(line) = lines.next_line().await? {
-        match line.split_once(';') {
-            None => {
-                buffer += "\n";
-                buffer += &line
-            }
-            Some((head, end)) => {
-                buffer += "\n";
-                buffer += head;
-                processor(Parser::parse_sql(dialect, &buffer)?).await?;
-                buffer = String::from(end);
-            }
-        }
+        println!();
     }
     Ok(())
 }
 
-async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
+pub async fn process_sql<'a, R>(
+    stdin: R,
+    dialect: &'a GenericDialect,
+) -> impl Stream<Item = Result<Statement>> + 'a
+where
+    R: AsyncRead + Unpin + 'a,
+{
+    let stdin = BufReader::new(stdin);
+    let mut buffer = String::new();
+    let mut lines = stdin.lines();
+    stream! {
+        while let Some(line) = lines.next_line().await? {
+            match line.split_once(';') {
+                None => {
+                    buffer += "\n";
+                    buffer += &line
+                }
+                Some((head, end)) => {
+                    buffer += "\n";
+                    buffer += head;
+                    for statement in Parser::parse_sql(dialect, &buffer)? {
+                        yield Ok(statement);
+                    }
+                    buffer = String::from(end);
+                }
+            }
+        }
+    }
+}
+
+pub async fn query_executor(
+    statement: Statement,
+    table_storage: &impl TableStorage,
+) -> Result<Vec<Vec<String>>> {
     let mut statement_result = Vec::new();
     match statement {
         Statement::Query(query) => match *query.body {
@@ -66,21 +76,11 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
                 for table in execution_plan.tables {
                     let rows = match table.fetch {
                         Fetch::FullScan => {
-                            let file = File::open(format!("{}.tsv", table.table)).await?;
-                            let mut reader = BufReader::new(file);
-                            let mut header = String::new();
-                            reader.read_line(&mut header).await?;
-                            let header: Vec<&str> = header.trim().split('\t').collect();
-                            let mut lines = reader.lines();
+                            let mut table_reader = table_storage.read_table(&table.table).await?;
+                            let header = table_reader.read_line().await?;
                             let mut rows: Vec<IndexMap<String, String>> = Vec::new();
-                            while let Some(line) = lines.next_line().await? {
-                                rows.push(
-                                    header
-                                        .iter()
-                                        .map(|value| (*value).into())
-                                        .zip(line.trim().split('\t').map(|value| value.into()))
-                                        .collect(),
-                                );
+                            while let Some(line) = table_reader.next_line().await? {
+                                rows.push(header.iter().cloned().zip(line).collect());
                             }
                             rows
                         }
@@ -152,22 +152,6 @@ async fn query_executor(statement: Statement) -> Result<Vec<Vec<String>>> {
                         );
                     }
                 }
-                // statement_result.push(header_result);
-                // let mut lines = reader.lines();
-                // while let Some(line) = lines.next_line().await? {
-                //     let fields: Vec<&str> = line.trim().split('\t').collect();
-                //     if match &select.selection {
-                //         None => true,
-                //         Some(expr) => evaluate_expression(&header, &fields, expr)?.to_bool(),
-                //     } {
-                //         statement_result.push(
-                //             projections_indexes
-                //                 .iter()
-                //                 .map(|pos| fields[*pos].to_string())
-                //                 .collect(),
-                //         );
-                //     }
-                // }
             }
             _ => bail!("Unimplemented for {}", query.body),
         },
@@ -354,4 +338,72 @@ pub struct TableFetch {
 
 pub enum Fetch {
     FullScan,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait TableStorage {
+    async fn read_table<'a>(&'a self, table: &str) -> Result<impl TableReader + 'a>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait TableReader {
+    async fn read_line(&mut self) -> Result<Vec<String>>;
+    async fn next_line(&mut self) -> Result<Option<Vec<String>>>;
+}
+
+struct LocalDiskTableStorage {
+    separator: &'static str,
+}
+
+impl LocalDiskTableStorage {
+    pub fn new(separator: &'static str) -> Self {
+        Self { separator }
+    }
+}
+
+struct AsyncBufReaderTableReader<R>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf_reader: R,
+    separator: &'static str,
+}
+
+impl TableStorage for LocalDiskTableStorage {
+    async fn read_table<'a>(&'a self, table: &str) -> Result<impl TableReader + 'a> {
+        let file = File::open(format!("{}.tsv", table)).await?;
+        let reader = BufReader::new(file);
+        Ok(AsyncBufReaderTableReader {
+            buf_reader: reader,
+            separator: self.separator,
+        })
+    }
+}
+
+impl<R> TableReader for AsyncBufReaderTableReader<R>
+where
+    R: AsyncBufRead + Unpin,
+{
+    async fn read_line(&mut self) -> Result<Vec<String>> {
+        let mut line = String::new();
+        self.buf_reader.read_line(&mut line).await?;
+        Ok(line
+            .trim()
+            .split(self.separator)
+            .map(|value| value.into())
+            .collect())
+    }
+    async fn next_line(&mut self) -> Result<Option<Vec<String>>> {
+        let mut line = String::new();
+        match self.buf_reader.read_line(&mut line).await {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(
+                line.trim()
+                    .split(self.separator)
+                    .map(|value| value.into())
+                    .collect(),
+            )),
+            Err(err) => Err(err.into()),
+        }
+    }
 }
