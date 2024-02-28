@@ -4,7 +4,10 @@ use sqlparser::dialect::GenericDialect;
 use std::collections::HashMap;
 use tokio::io::BufReader;
 
-use crate::{process_sql, query_executor, AsyncBufReaderTableReader, TableStorage};
+use crate::{
+    process_sql, query_executor,
+    query_executor::{AsyncBufReaderTableReader, TableStorage},
+};
 
 #[tokio::test]
 async fn select_all() -> Result<()> {
@@ -194,21 +197,23 @@ async fn select_join_with_alias() -> Result<()> {
 }
 
 fn build_table_storage_for_test() -> InMemoryTableStorage {
-    InMemoryTableStorage::new(";").add_table(
-        "test",
-        r#"id;field1;field2
+    InMemoryTableStorage::new(";")
+        .add_table(
+            "test",
+            r#"id;field1;field2
 1;First Name;1001
 2;Second Name;2002
 3;Third Name;1001
 "#,
-    ).add_table(
-        "test_2",
-        r#"id;test_id
+        )
+        .add_table(
+            "test_2",
+            r#"id;test_id
 1;1
 2;1
 3;2
 "#,
-    )
+        )
 }
 
 async fn process_statement(
@@ -245,15 +250,18 @@ impl InMemoryTableStorage {
 }
 
 impl TableStorage for InMemoryTableStorage {
-    async fn read_table<'a>(&'a self, table: &str) -> Result<impl crate::TableReader + 'a> {
-        Ok(AsyncBufReaderTableReader {
-            separator: self.separator,
-            buf_reader: BufReader::new(
+    async fn read_table<'a>(
+        &'a self,
+        table: &str,
+    ) -> Result<impl crate::query_executor::TableReader + 'a> {
+        Ok(AsyncBufReaderTableReader::new(
+            BufReader::new(
                 self.tables
                     .get(table)
                     .ok_or(anyhow!("Table not found {table}"))?
                     .as_bytes(),
             ),
-        })
+            self.separator,
+        ))
     }
 }
