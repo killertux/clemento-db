@@ -2,7 +2,6 @@ use anyhow::{anyhow, bail, Result};
 use async_stream::stream;
 use bigdecimal::{BigDecimal, ToPrimitive};
 use futures_util::{pin_mut, Stream, StreamExt};
-use indexmap::IndexMap;
 use sqlparser::ast::{
     BinaryOperator, DataType, Expr, JoinConstraint, JoinOperator, Select, SelectItem, SetExpr,
     Statement, TableFactor, Value as AstValue,
@@ -18,7 +17,7 @@ mod single_table_select_test;
 #[tokio::main]
 async fn main() -> Result<()> {
     let dialect = GenericDialect {};
-    let table_storage = LocalDiskTableStorage::new("\t");
+    let table_storage = LocalDiskTableStorage::new(";");
     let statements = process_sql(stdin(), &dialect).await;
     pin_mut!(statements);
     while let Some(statement) = statements.next().await {
@@ -71,16 +70,17 @@ pub async fn query_executor(
         Statement::Query(query) => match *query.body {
             SetExpr::Select(select) => {
                 let execution_plan = select_plan(*select.clone())?;
-                let mut data = Vec::new();
-                // let mut data_columns = IndexSet::new();
+                let mut data: Vec<Vec<String>> = Vec::new();
+                let mut data_columns = Vec::new();
                 for table in execution_plan.tables {
                     let rows = match table.fetch {
                         Fetch::FullScan => {
                             let mut table_reader = table_storage.read_table(&table.table).await?;
                             let header = table_reader.read_line().await?;
-                            let mut rows: Vec<IndexMap<String, String>> = Vec::new();
+                            data_columns.extend(header.into_iter().map(|column| (table.alias.clone().unwrap_or(table.table.clone()), column)));
+                            let mut rows: Vec<Vec<String>> = Vec::new();
                             while let Some(line) = table_reader.next_line().await? {
-                                rows.push(header.iter().cloned().zip(line).collect());
+                                rows.push(line);
                             }
                             rows
                         }
@@ -95,39 +95,39 @@ pub async fn query_executor(
                                     exisent_row
                                         .iter()
                                         .chain(new_row.iter())
-                                        .map(|(index, value)| {
-                                            (index.to_string(), value.to_string())
+                                        .map(|value| {
+                                            value.to_owned()
                                         })
-                                        .collect::<IndexMap<String, String>>()
+                                        .collect::<Vec<String>>()
                                 })
                             })
                             .collect();
                     }
                 }
-                let mut projections: Vec<(String, String)> = Vec::new();
+                let mut projections: Vec<(usize, String)> = Vec::new();
                 for projection in select.projection {
                     match projection {
                         SelectItem::Wildcard(_) => {
                             projections
-                                .extend(data[0].keys().map(|key| (key.clone(), key.clone())));
+                                .extend(data_columns.iter().enumerate().map(|(index, (_, name))| (index, name.clone())));
                         }
                         SelectItem::UnnamedExpr(expr) => {
                             let Expr::Identifier(ident) = expr else {
                                 bail!("Can only project identifiers. {expr} given")
                             };
-                            if !data[0].contains_key(&ident.value) {
+                            let Some(pos) = data_columns.iter().position(|(_, column)| *column == ident.value) else {
                                 bail!("Column {} not found", ident.value)
-                            }
-                            projections.push((ident.value.clone(), ident.value));
+                            };
+                            projections.push((pos, ident.value));
                         }
                         SelectItem::ExprWithAlias { expr, alias } => {
                             let Expr::Identifier(ident) = expr else {
                                 bail!("Can only project identifiers. {expr} given")
                             };
-                            if !data[0].contains_key(&ident.value) {
+                            let Some(pos) = data_columns.iter().position(|(_, column)| *column == ident.value) else {
                                 bail!("Column {} not found", ident.value)
-                            }
-                            projections.push((ident.value, alias.value));
+                            };
+                            projections.push((pos, alias.value));
                         }
                         _ => bail!("Unimplemented for {projection}"),
                     }
@@ -139,12 +139,12 @@ pub async fn query_executor(
                         .collect::<Vec<String>>(),
                 );
                 for row in data.into_iter() {
-                    if evaluate_expression(&row, &execution_plan.filters)?.to_bool() {
+                    if evaluate_expression(&row, &data_columns, &execution_plan.filters)?.to_bool() {
                         statement_result.push(
                             projections
                                 .iter()
                                 .map(|(field, _)| {
-                                    row.get(field)
+                                    row.get(*field)
                                         .ok_or(anyhow!("Field {field} not found in data"))
                                         .cloned()
                                 })
@@ -160,14 +160,25 @@ pub async fn query_executor(
     Ok(statement_result)
 }
 
-fn evaluate_expression(row: &IndexMap<String, String>, expression: &Expr) -> Result<Value> {
+fn evaluate_expression(row: &[String], data_columns: &[(String, String)], expression: &Expr) -> Result<Value> {
     Ok(match expression {
         Expr::Identifier(identifier) => {
-            let value = row
-                .get(&identifier.value)
-                .ok_or(anyhow!("Failed to find column {identifier}"))?;
+            let Some(pos) = data_columns.iter().position(|(_, column)| *column == identifier.value) else {
+                bail!("Failed to find column {}", identifier.value)
+            };
+            let value = row.get(pos).ok_or(anyhow!("Failed to find data"))?;
             Value::String(value.clone())
         }
+        Expr::CompoundIdentifier(identifiers) => {
+            if identifiers.len() != 2 { 
+                bail!("Can only process compound indentifiers with two fields");
+            }
+            let Some(pos) = data_columns.iter().position(|(table, column)| *table == identifiers[0].value && *column == identifiers[1].value) else {
+                bail!("Failed to find column {:?}", identifiers)
+            };
+            let value = row.get(pos).ok_or(anyhow!("Failed to find data"))?;
+            Value::String(value.clone())
+        },
         Expr::Value(value) => match value {
             AstValue::Boolean(value) => (*value).into(),
             AstValue::DoubleQuotedString(string) | AstValue::SingleQuotedString(string) => {
@@ -187,22 +198,22 @@ fn evaluate_expression(row: &IndexMap<String, String>, expression: &Expr) -> Res
             }
             _ => bail!("Not implemented value {value}"),
         },
-        Expr::IsFalse(expr) => (!evaluate_expression(row, expr)?.to_bool()).into(),
-        Expr::IsNotFalse(expr) => evaluate_expression(row, expr)?.to_bool().into(),
-        Expr::IsTrue(expr) => evaluate_expression(row, expr)?.to_bool().into(),
-        Expr::IsNotTrue(expr) => (!evaluate_expression(row, expr)?.to_bool()).into(),
-        Expr::IsNull(expr) => matches!(evaluate_expression(row, expr)?, Value::Null).into(),
-        Expr::IsNotNull(expr) => (!matches!(evaluate_expression(row, expr)?, Value::Null)).into(),
+        Expr::IsFalse(expr) => (!evaluate_expression(row, data_columns, expr)?.to_bool()).into(),
+        Expr::IsNotFalse(expr) => evaluate_expression(row,data_columns, expr)?.to_bool().into(),
+        Expr::IsTrue(expr) => evaluate_expression(row,data_columns, expr)?.to_bool().into(),
+        Expr::IsNotTrue(expr) => (!evaluate_expression(row,data_columns, expr)?.to_bool()).into(),
+        Expr::IsNull(expr) => matches!(evaluate_expression(row,data_columns, expr)?, Value::Null).into(),
+        Expr::IsNotNull(expr) => (!matches!(evaluate_expression(row,data_columns, expr)?, Value::Null)).into(),
         Expr::BinaryOp { left, op, right } => {
-            let left = evaluate_expression(row, left)?;
+            let left = evaluate_expression(row,data_columns, left)?;
             match op {
                 BinaryOperator::And => {
-                    (left.to_bool() && evaluate_expression(row, right)?.to_bool()).into()
+                    (left.to_bool() && evaluate_expression(row,data_columns, right)?.to_bool()).into()
                 }
                 BinaryOperator::Or => {
-                    (left.to_bool() || evaluate_expression(row, right)?.to_bool()).into()
+                    (left.to_bool() || evaluate_expression(row,data_columns, right)?.to_bool()).into()
                 }
-                BinaryOperator::Eq => (left == evaluate_expression(row, right)?).into(),
+                BinaryOperator::Eq => (left == evaluate_expression(row,data_columns, right)?).into(),
                 _ => bail!("Not implemented operator {op}"),
             }
         }
@@ -214,7 +225,7 @@ fn evaluate_expression(row: &IndexMap<String, String>, expression: &Expr) -> Res
             if format.is_some() {
                 bail!("Cannot format in casts");
             }
-            let value = evaluate_expression(row, expr)?;
+            let value = evaluate_expression(row,data_columns, expr)?;
             match (&value, data_type) {
                 (Value::Integer(value), DataType::Text) => Value::String(value.to_string()),
                 (Value::String(value), DataType::Integer(_)) => Value::Integer(value.parse()?),
@@ -277,7 +288,7 @@ fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
     for join in table.joins {
         let TableFactor::Table {
             name,
-            alias: _,
+            alias,
             args: _,
             with_hints: _,
             version: _,
@@ -289,6 +300,7 @@ fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
         execution_plan_tables.push(TableFetch {
             fetch: Fetch::FullScan,
             table: name.to_string(),
+            alias: alias.map(|alias| alias.name.to_string())
         });
         let JoinOperator::Inner(constraint) = join.join_operator else {
             bail!("Cannot process join {:?}", join.join_operator)
@@ -307,7 +319,7 @@ fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
     }
     let TableFactor::Table {
         name,
-        alias: _,
+        alias,
         args: _,
         with_hints: _,
         version: _,
@@ -316,9 +328,10 @@ fn select_plan(mut select: Select) -> Result<ExecutionPlan> {
     else {
         bail!("Can only process Tables. {} given.", table.relation)
     };
-    execution_plan_tables.push(TableFetch {
+    execution_plan_tables.insert(0, TableFetch {
         fetch: Fetch::FullScan,
         table: name.to_string(),
+        alias: alias.map(|alias| alias.name.to_string())
     });
     Ok(ExecutionPlan {
         tables: execution_plan_tables,
@@ -334,6 +347,7 @@ pub struct ExecutionPlan {
 pub struct TableFetch {
     fetch: Fetch,
     table: String,
+    alias: Option<String>,
 }
 
 pub enum Fetch {

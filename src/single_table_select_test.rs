@@ -153,6 +153,46 @@ async fn select_or() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn select_join() -> Result<()> {
+    let table_storage = build_table_storage_for_test();
+    let result = process_statement(
+        "SELECT * FROM test JOIN test_2 ON test.id = test_2.test_id;",
+        &table_storage,
+    )
+    .await?;
+    assert_eq!(
+        vec![
+            vec!["id", "field1", "field2", "id", "test_id"],
+            vec!["1", "First Name", "1001", "1", "1"],
+            vec!["1", "First Name", "1001", "2", "1"],
+            vec!["2", "Second Name", "2002", "3", "2"],
+        ],
+        result
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn select_join_with_alias() -> Result<()> {
+    let table_storage = build_table_storage_for_test();
+    let result = process_statement(
+        "SELECT * FROM test t JOIN test_2 t2 ON t.id = t2.test_id;",
+        &table_storage,
+    )
+    .await?;
+    assert_eq!(
+        vec![
+            vec!["id", "field1", "field2", "id", "test_id"],
+            vec!["1", "First Name", "1001", "1", "1"],
+            vec!["1", "First Name", "1001", "2", "1"],
+            vec!["2", "Second Name", "2002", "3", "2"],
+        ],
+        result
+    );
+    Ok(())
+}
+
 fn build_table_storage_for_test() -> InMemoryTableStorage {
     InMemoryTableStorage::new(";").add_table(
         "test",
@@ -160,6 +200,13 @@ fn build_table_storage_for_test() -> InMemoryTableStorage {
 1;First Name;1001
 2;Second Name;2002
 3;Third Name;1001
+"#,
+    ).add_table(
+        "test_2",
+        r#"id;test_id
+1;1
+2;1
+3;2
 "#,
     )
 }
