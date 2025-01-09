@@ -114,13 +114,23 @@ impl UVarInt {
         Ok(())
     }
 
-    fn is_zero(&self) -> bool {
+    pub fn is_zero(&self) -> bool {
         match self {
             UVarInt::U8(n) => *n == 0,
             UVarInt::U16(n) => *n == 0,
             UVarInt::U32(n) => *n == 0,
             UVarInt::U64(n) => *n == 0,
             UVarInt::U128(n) => *n == 0,
+        }
+    }
+
+    pub fn is_one(&self) -> bool {
+        match self {
+            UVarInt::U8(n) => *n == 1,
+            UVarInt::U16(n) => *n == 1,
+            UVarInt::U32(n) => *n == 1,
+            UVarInt::U64(n) => *n == 1,
+            UVarInt::U128(n) => *n == 1,
         }
     }
 

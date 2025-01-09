@@ -207,4 +207,39 @@ mod tests {
             value_3
         );
     }
+
+    #[tokio::test]
+    async fn test_more_than_memtable_limit_with_deletions_and_nulls() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lsm = LSM::new(11, 10, temp_dir.path().to_string_lossy().to_string());
+        let key_1 = Bytes::from("key 1");
+        let key_2 = Bytes::from([0u8, 0xff, 0].as_slice());
+        let key_3 = Bytes::from("key 3");
+        let value_1 = Bytes::from("v1");
+        let value_2 = Bytes::from([1, 0u8, 0xff, 0xff, 0u8].as_slice());
+        let value_3 = Bytes::from("v3");
+        lsm.put(Cow::Borrowed(&key_1), value_1.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_2), value_2.clone())
+            .await
+            .unwrap();
+        lsm.delete(Cow::Borrowed(&key_2)).await.unwrap();
+        lsm.put(Cow::Borrowed(&key_3), value_3.clone())
+            .await
+            .unwrap();
+        assert_eq!(lsm.memtable.size(), 0);
+        assert_eq!(
+            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
+            value_1
+        );
+        assert_eq!(
+            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
+            value_2
+        );
+        assert_eq!(
+            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
+            value_3
+        );
+    }
 }

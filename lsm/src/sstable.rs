@@ -1,6 +1,8 @@
-use std::io::{Cursor, ErrorKind, SeekFrom};
+use std::io::{ErrorKind, SeekFrom};
 
 use bloomfilter::Bloom;
+use bytes::{BufMut, Bytes, BytesMut};
+use itertools::Itertools;
 use thiserror::Error;
 use tokio::{
     fs::File,
@@ -44,38 +46,32 @@ impl SSTable {
         ))
         .await?;
         self.metadata.store(&mut file).await?;
-        let n_entries: u64 = self.data.len().try_into().map_err_into_other_error()?;
-        file.write_u64(n_entries).await?;
-        let mut buffer = Cursor::new(Vec::new());
-        let mut value_cursor = 0;
-        for (key, value) in self.data.iter() {
+        file.write_u8(0).await?;
+        for (key, value) in self.data {
+            let key = quote_null_bytes(key);
             let key_size = key.len();
             UVarInt::try_from(key_size)
                 .map_err_into_other_error()?
-                .write(&mut buffer)
+                .write(&mut file)
                 .await?;
-            buffer.write_all(&key).await?;
-            UVarInt::try_from(value_cursor)
-                .map_err_into_other_error()?
-                .write(&mut buffer)
-                .await?;
-            value_cursor += 4 + value.size()
-        }
-        let buffer = buffer.into_inner();
-        let buffer_len: u64 = buffer.len().try_into().map_err_into_other_error()?;
-        file.write_u64(buffer_len).await?;
-        file.write_all(&buffer).await?;
-        for (_, value) in self.data {
+            file.write_all(&key).await?;
             match value {
                 Value::Data(value) => {
-                    file.write_u32(u32::try_from(value.len()).map_err_into_other_error()? + 1)
+                    let value = quote_null_bytes(value);
+                    UVarInt::try_from(value.len() + 2)
+                        .map_err_into_other_error()?
+                        .write(&mut file)
                         .await?;
                     file.write_all(&value).await?;
                 }
                 Value::TombStone => {
-                    file.write_u32(0).await?;
+                    UVarInt::try_from(1)
+                        .map_err_into_other_error()?
+                        .write(&mut file)
+                        .await?;
                 }
             }
+            file.write_u8(0).await?;
         }
         Ok(self.metadata)
     }
@@ -96,39 +92,98 @@ impl SSTable {
             .await?
             .try_into()
             .map_err_into_other_error()?;
-        let metadata_size = dbg!(bloom_filter_size + 9);
-        let pos = file.seek(SeekFrom::Current(metadata_size as i64)).await?;
-        let mut n_entries = dbg!(file.read_u64().await?);
-        let value_offset = dbg!(file.read_u64().await?);
-        loop {
+        let metadata_size = bloom_filter_size + 9;
+        let mut start = file.seek(SeekFrom::Current(metadata_size as i64)).await?;
+        let mut end = file.seek(SeekFrom::End(0)).await?;
+        'external: loop {
+            let mut mid = (start + end) / 2;
+            let initial_mid = mid;
+            file.seek(SeekFrom::Start(mid)).await?;
+            let mut old_bytes = None;
+            'inner: loop {
+                match file.read_u8().await {
+                    Ok(0) if old_bytes != Some(0xff) => {
+                        break 'inner;
+                    }
+                    Ok(byte) => {
+                        old_bytes = Some(byte);
+                        if mid == start {
+                            return Ok(None);
+                        }
+                        mid += 1;
+                        if mid >= end {
+                            end = initial_mid;
+                            continue 'external;
+                        }
+                    }
+                    Err(err) if matches!(err.kind(), ErrorKind::UnexpectedEof) => {
+                        end = mid;
+                        continue 'external;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
             let key_size: usize = UVarInt::read(&mut file)
                 .await?
                 .try_into()
                 .map_err_into_other_error()?;
-            let mut loaded_key = vec![0; key_size];
-            file.read_exact(&mut loaded_key).await?;
-            let offset: u64 = dbg!(UVarInt::read(&mut file)
-                .await?
-                .try_into()
-                .map_err_into_other_error()?);
+            let loaded_key = {
+                let mut key = vec![0u8; key_size];
+                file.read_exact(&mut key).await?;
+                unquote_null_bytes(key.into())
+            };
             if loaded_key == *key {
-                file.seek(SeekFrom::Start(pos + value_offset + offset + 16))
-                    .await?;
-                let value_size = dbg!(file.read_u32().await?);
-                if value_size == 0 {
+                let value_size = UVarInt::read(&mut file).await?;
+                if value_size.is_one() {
                     return Ok(Some(Value::TombStone));
                 }
-                let mut value = vec![0; value_size as usize - 1];
+                let value_size: usize = value_size.try_into().map_err_into_other_error()?;
+                let value_size = value_size - 2usize;
+                let mut value = vec![0u8; value_size as usize];
                 file.read_exact(&mut value).await?;
-                return Ok(Some(Value::Data(value.into())));
+                let value = unquote_null_bytes(value.into());
+                return Ok(Some(Value::Data(value)));
             }
-            n_entries -= 1;
-            if n_entries == 0 {
-                break;
+            if loaded_key < *key {
+                start = mid;
+            } else {
+                end = mid;
             }
         }
-        Ok(None)
     }
+}
+
+fn quote_null_bytes(bytes: Bytes) -> Bytes {
+    bytes
+        .into_iter()
+        .fold(BytesMut::new(), |mut acc, byte| {
+            if byte == 0u8 {
+                acc.put_u8(0xff);
+                acc.put_u8(0);
+                acc
+            } else {
+                acc.put_u8(byte);
+                acc
+            }
+        })
+        .into()
+}
+
+fn unquote_null_bytes(bytes: Bytes) -> Bytes {
+    let last = bytes.last().cloned();
+    bytes
+        .into_iter()
+        .tuple_windows()
+        .filter_map(|(first, second)| {
+            if first == 0xff && second == 0 {
+                None
+            } else {
+                Some(first)
+            }
+        })
+        .chain(last)
+        .collect()
 }
 
 #[derive(Debug, Error)]
@@ -158,7 +213,7 @@ impl SSTableMetadata {
 
     async fn store(&self, file: &mut File) -> Result<(), std::io::Error> {
         let bloom_filter_slice = self.bloom_filter.as_slice();
-        UVarInt::try_from(dbg!(bloom_filter_slice.len()))
+        UVarInt::try_from(bloom_filter_slice.len())
             .map_err_into_other_error()?
             .write(file)
             .await?;
