@@ -105,7 +105,7 @@ impl UVarInt {
             if bytes.is_empty() {
                 bytes.put_u8(byte);
             } else {
-                bytes.put_u8((byte | 0b10000000) as u8);
+                bytes.put_u8(byte | 0b10000000);
             }
         }
         for byte in (*bytes).into_iter().rev() {

@@ -19,7 +19,7 @@ impl Memtable {
         let value_size = value.size();
         match self.data.binary_search_by(|entry| entry.0.cmp(&key)) {
             Ok(index) => {
-                let old_value_size = &self.data[index].1.size();
+                let old_value_size = self.data[index].1.size();
                 self.data[index].1 = value;
                 self.size -= old_value_size;
                 self.size += value_size;
