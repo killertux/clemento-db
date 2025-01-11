@@ -11,7 +11,7 @@ use tokio::{
 
 use crate::{
     memtable::{Key, Memtable, Value},
-    types::UVarInt,
+    types::{Fixed28BitsInt, Fixed56BitsInt, UVarInt},
 };
 
 pub struct SSTable {
@@ -19,13 +19,15 @@ pub struct SSTable {
     data: Vec<(Key, Value)>,
 }
 
+const BLOOM_FILTER_FP: f64 = 0.1;
+
 impl SSTable {
     pub fn try_from_memtable(
         memtable: Memtable,
         file_id: u64,
     ) -> Result<Self, ErrorCreatingSSTable> {
         let data = memtable.data();
-        let mut bloom_filter = Bloom::new_for_fp_rate(data.len(), 0.01)
+        let mut bloom_filter = Bloom::new_for_fp_rate(data.len(), BLOOM_FILTER_FP)
             .map_err(|err| ErrorCreatingSSTable::BloomFilterError(err))?;
         data.iter().for_each(|entry| bloom_filter.set(&entry.0));
         let metadata = SSTableMetadata {
@@ -41,41 +43,52 @@ impl SSTable {
         self,
         base_path: &str,
     ) -> Result<SSTableMetadata, std::io::Error> {
-        let mut file = BufWriter::new(
+        let mut keys_file = BufWriter::new(
             File::create(format!(
-                "{base_path}/{}_{:08}.sst",
+                "{base_path}/{}_{:08}.sst_keys",
+                self.metadata.level, self.metadata.file_id
+            ))
+            .await?,
+        );
+        let mut values_file = BufWriter::new(
+            File::create(format!(
+                "{base_path}/{}_{:08}.sst_values",
                 self.metadata.level, self.metadata.file_id
             ))
             .await?,
         );
         self.metadata.store(base_path).await?;
+        let mut values_cursor: usize = 0;
         for (key, value) in self.data {
-            file.write_u8(0).await?;
+            keys_file.write_u8(0).await?;
             let key = quote_null_bytes(key);
             let key_size = key.len();
-            UVarInt::try_from(key_size)
-                .map_err_into_other_error()?
-                .write(&mut file)
+            Fixed28BitsInt::new(key_size.try_into().map_err_into_other_error()?)
+                .write(&mut keys_file)
                 .await?;
-            file.write_all(&key).await?;
+            keys_file.write_all(&key).await?;
+            Fixed56BitsInt::new(values_cursor.try_into().map_err_into_other_error()?)
+                .write(&mut keys_file)
+                .await?;
             match value {
                 Value::Data(value) => {
-                    let value = quote_null_bytes(value);
-                    UVarInt::try_from(value.len() + 2)
+                    values_cursor += UVarInt::try_from(value.len() + 1)
                         .map_err_into_other_error()?
-                        .write(&mut file)
+                        .write(&mut values_file)
                         .await?;
-                    file.write_all(&value).await?;
+                    values_cursor += value.len();
+                    values_file.write_all(&value).await?;
                 }
                 Value::TombStone => {
-                    UVarInt::try_from(1)
+                    values_cursor += UVarInt::try_from(0)
                         .map_err_into_other_error()?
-                        .write(&mut file)
+                        .write(&mut values_file)
                         .await?;
                 }
             }
         }
-        file.flush().await?;
+        keys_file.flush().await?;
+        values_file.flush().await?;
         Ok(self.metadata)
     }
 
@@ -84,22 +97,22 @@ impl SSTable {
         base_path: &str,
         key: &Key,
     ) -> Result<Option<Value>, std::io::Error> {
-        let mut file = BufReader::new(
+        let mut keys_file = BufReader::new(
             File::open(format!(
-                "{base_path}/{}_{:08}.sst",
+                "{base_path}/{}_{:08}.sst_keys",
                 metadata.level, metadata.file_id
             ))
             .await?,
         );
         let mut start = 0;
-        let mut end = file.seek(SeekFrom::End(0)).await?;
+        let mut end = keys_file.seek(SeekFrom::End(0)).await?;
         'external: loop {
             let mut mid = (start + end) / 2;
             let initial_mid = mid;
-            let pos = file.seek(SeekFrom::Start(mid)).await?;
+            let pos = keys_file.seek(SeekFrom::Start(mid)).await?;
             let mut old_bytes = None;
             'inner: loop {
-                match file.read_u8().await {
+                match keys_file.read_u8().await {
                     Ok(0) if old_bytes.is_some() && old_bytes != Some(0xff) || pos == 0 => {
                         break 'inner;
                     }
@@ -122,26 +135,47 @@ impl SSTable {
                 }
             }
 
-            let key_size: usize = UVarInt::read(&mut file)
+            let key_size: usize = Fixed28BitsInt::read(&mut keys_file)
                 .await?
+                .value()
                 .try_into()
                 .map_err_into_other_error()?;
             let loaded_key = {
                 let mut key = vec![0u8; key_size];
-                file.read_exact(&mut key).await?;
+                keys_file.read_exact(&mut key).await?;
                 unquote_null_bytes(key.into())
             };
+            let n_loaded_key = u64::from_be_bytes(loaded_key.as_ref().try_into().unwrap());
+            let n_key = u64::from_be_bytes(key.as_ref().try_into().unwrap());
+            println!(
+                "{},{},{},{}",
+                n_loaded_key,
+                n_key,
+                n_loaded_key < n_key,
+                loaded_key < *key
+            );
             if loaded_key == *key {
-                let value_size = UVarInt::read(&mut file).await?;
-                if value_size.is_one() {
+                let value_pos: usize = Fixed56BitsInt::read(&mut keys_file)
+                    .await?
+                    .value()
+                    .try_into()
+                    .map_err_into_other_error()?;
+                let mut values_file = BufReader::new(
+                    File::open(format!(
+                        "{base_path}/{}_{:08}.sst_values",
+                        metadata.level, metadata.file_id
+                    ))
+                    .await?,
+                );
+                values_file.seek(SeekFrom::Start(value_pos as u64)).await?;
+                let value_size = UVarInt::read(&mut values_file).await?;
+                if value_size.is_zero() {
                     return Ok(Some(Value::TombStone));
                 }
                 let value_size: usize = value_size.try_into().map_err_into_other_error()?;
-                let value_size = value_size - 2usize;
-                let mut value = vec![0u8; value_size as usize];
-                file.read_exact(&mut value).await?;
-                let value = unquote_null_bytes(value.into());
-                return Ok(Some(Value::Data(value)));
+                let mut value = vec![0u8; value_size - 1];
+                values_file.read_exact(&mut value).await?;
+                return Ok(Some(Value::Data(value.into())));
             }
             if loaded_key < *key {
                 start = initial_mid;
@@ -157,23 +191,38 @@ impl SSTable {
         new_level: u8,
         new_file_id: u64,
     ) -> Result<SSTableMetadata, SSTableCompactError> {
-        dbg!("Running compact");
+        println!("Compacting...");
         let mut readers = Vec::new();
         for metadata in metadatas.iter().rev() {
             let reader = Self::key_value_reader(base_path, metadata).await?;
             readers.push(reader);
         }
 
-        let mut file = BufWriter::new(
+        let mut keys_file = BufWriter::new(
             File::options()
                 .create(true)
                 .write(true)
                 .read(true)
-                .open(format!("{base_path}/{}_{:08}.sst", new_level, new_file_id))
+                .open(format!(
+                    "{base_path}/{}_{:08}.sst_keys",
+                    new_level, new_file_id
+                ))
+                .await?,
+        );
+        let mut values_file = BufWriter::new(
+            File::options()
+                .create(true)
+                .write(true)
+                .read(true)
+                .open(format!(
+                    "{base_path}/{}_{:08}.sst_values",
+                    new_level, new_file_id
+                ))
                 .await?,
         );
 
         let mut n_entries = 0;
+        let mut values_cursor = 0;
         loop {
             let mut min_key: Option<Key> = None;
             let mut min_value = None;
@@ -200,27 +249,28 @@ impl SSTable {
                 continue;
             }
             n_entries += 1;
-            file.write_u8(0).await?;
+            keys_file.write_u8(0).await?;
             let quoted_key = quote_null_bytes(key.clone());
-            let key_size = quoted_key.len();
-            UVarInt::try_from(key_size)
-                .map_err_into_other_error()?
-                .write(&mut file)
+            Fixed28BitsInt::new(quoted_key.len().try_into().map_err_into_other_error()?)
+                .write(&mut keys_file)
                 .await?;
-            file.write_all(&quoted_key).await?;
+            keys_file.write_all(&quoted_key).await?;
+            Fixed56BitsInt::new(values_cursor.try_into().map_err_into_other_error()?)
+                .write(&mut keys_file)
+                .await?;
             match value {
                 Value::Data(value) => {
-                    let value = quote_null_bytes(value.clone());
-                    UVarInt::try_from(value.len() + 2)
+                    values_cursor += UVarInt::try_from(value.len() + 1)
                         .map_err_into_other_error()?
-                        .write(&mut file)
+                        .write(&mut values_file)
                         .await?;
-                    file.write_all(&value).await?;
+                    values_cursor += value.len();
+                    values_file.write_all(&value).await?;
                 }
                 Value::TombStone => {
-                    UVarInt::try_from(1)
+                    values_cursor += UVarInt::try_from(0)
                         .map_err_into_other_error()?
-                        .write(&mut file)
+                        .write(&mut values_file)
                         .await?;
                 }
             }
@@ -232,19 +282,19 @@ impl SSTable {
                 }
             }
         }
-        file.flush().await?;
-        let mut bloom_filter = Bloom::new_for_fp_rate(n_entries, 0.01)
+        keys_file.flush().await?;
+        values_file.flush().await?;
+        let mut bloom_filter = Bloom::new_for_fp_rate(n_entries, BLOOM_FILTER_FP)
             .map_err(|err| ErrorCreatingSSTable::BloomFilterError(err))?;
         {
-            let mut file = file.into_inner();
+            let mut file = keys_file.into_inner();
             file.seek(SeekFrom::Start(0)).await?;
-            let mut reader = KeyValueReader {
-                reader: BufReader::new(file),
+            let mut reader = KeyReader {
+                keys_reader: BufReader::new(file),
                 n_entries: n_entries as u64,
                 read_entries: 0,
-                element: None,
             };
-            while let Some((key, _)) = reader.read().await? {
+            while let Some(key) = reader.read().await? {
                 bloom_filter.set(&key);
             }
         }
@@ -257,7 +307,12 @@ impl SSTable {
         metadata.store(base_path).await?;
         for metadata in metadatas {
             tokio::fs::remove_file(format!(
-                "{base_path}/{}_{:08}.sst",
+                "{base_path}/{}_{:08}.sst_keys",
+                metadata.level, metadata.file_id
+            ))
+            .await?;
+            tokio::fs::remove_file(format!(
+                "{base_path}/{}_{:08}.sst_values",
                 metadata.level, metadata.file_id
             ))
             .await?;
@@ -273,17 +328,26 @@ impl SSTable {
     async fn key_value_reader(
         base_path: &str,
         metadata: &SSTableMetadata,
-    ) -> Result<KeyValueReader<BufReader<File>>, std::io::Error> {
-        let file = BufReader::new(
+    ) -> Result<KeyValueReader<BufReader<File>, BufReader<File>>, std::io::Error> {
+        let keys_file = BufReader::new(
             File::open(format!(
-                "{base_path}/{}_{:08}.sst",
+                "{base_path}/{}_{:08}.sst_keys",
+                metadata.level, metadata.file_id
+            ))
+            .await
+            .unwrap(),
+        );
+        let values_file = BufReader::new(
+            File::open(format!(
+                "{base_path}/{}_{:08}.sst_values",
                 metadata.level, metadata.file_id
             ))
             .await
             .unwrap(),
         );
         Ok(KeyValueReader {
-            reader: file,
+            keys_reader: keys_file,
+            value_reder: values_file,
             n_entries: metadata.n_entries,
             read_entries: 0,
             element: None,
@@ -292,16 +356,18 @@ impl SSTable {
 }
 
 #[derive(Debug)]
-struct KeyValueReader<R> {
-    reader: R,
+struct KeyValueReader<KeyR, ValueR> {
+    keys_reader: KeyR,
+    value_reder: ValueR,
     n_entries: u64,
     read_entries: u64,
     element: Option<(Key, Value)>,
 }
 
-impl<R> KeyValueReader<R>
+impl<KeyR, ValueR> KeyValueReader<KeyR, ValueR>
 where
-    R: AsyncRead + Unpin,
+    KeyR: AsyncRead + Unpin,
+    ValueR: AsyncRead + Unpin,
 {
     async fn read_without_consuming(&mut self) -> Result<Option<&(Key, Value)>, std::io::Error> {
         if self.element.is_none() {
@@ -318,31 +384,64 @@ where
         if self.read_entries == self.n_entries {
             return Ok(None);
         }
-        if self.reader.read_u8().await? != 0 {
+        if self.keys_reader.read_u8().await? != 0 {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "Invalid entry in SSTable",
             ));
         };
-        let key_size = UVarInt::read(&mut self.reader).await?;
+        self.read_entries += 1;
+        let key_size = Fixed28BitsInt::read(&mut self.keys_reader).await?.value();
         let key_size: usize = key_size.try_into().map_err_into_other_error()?;
         let key = {
             let mut key = vec![0u8; key_size];
-            self.reader.read_exact(&mut key).await?;
+            self.keys_reader.read_exact(&mut key).await?;
             unquote_null_bytes(key.into())
         };
-        let value_size = UVarInt::read(&mut self.reader).await?;
-        if value_size.is_one() {
-            self.read_entries += 1;
+        let _ = Fixed56BitsInt::read(&mut self.keys_reader).await?;
+        let value_size = UVarInt::read(&mut self.value_reder).await?;
+        if value_size.is_zero() {
             return Ok(Some((key, Value::TombStone)));
         }
         let value_size: usize = value_size.try_into().map_err_into_other_error()?;
-        let value_size = value_size - 2usize;
+        let value_size = value_size - 1usize;
         let mut value = vec![0u8; value_size as usize];
-        self.reader.read_exact(&mut value).await?;
-        let value = unquote_null_bytes(value.into());
+        self.value_reder.read_exact(&mut value).await?;
+        Ok(Some((key, Value::Data(value.into()))))
+    }
+}
+
+#[derive(Debug)]
+struct KeyReader<R> {
+    keys_reader: R,
+    n_entries: u64,
+    read_entries: u64,
+}
+
+impl<R> KeyReader<R>
+where
+    R: AsyncRead + Unpin,
+{
+    async fn read(&mut self) -> Result<Option<Key>, std::io::Error> {
+        if self.read_entries == self.n_entries {
+            return Ok(None);
+        }
+        if self.keys_reader.read_u8().await? != 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid entry in SSTable",
+            ));
+        };
         self.read_entries += 1;
-        Ok(Some((key, Value::Data(value))))
+        let key_size = Fixed28BitsInt::read(&mut self.keys_reader).await?.value();
+        let key_size: usize = key_size.try_into().map_err_into_other_error()?;
+        let key = {
+            let mut key = vec![0u8; key_size];
+            self.keys_reader.read_exact(&mut key).await?;
+            unquote_null_bytes(key.into())
+        };
+        let _ = Fixed56BitsInt::read(&mut self.keys_reader).await?;
+        Ok(Some(key))
     }
 }
 
@@ -447,6 +546,15 @@ mod test {
     use std::borrow::Cow;
 
     use super::*;
+
+    #[test]
+    fn quote_unqute() {
+        let bytes = vec![0u8, 1, 0xff, 0, 2, 0xff, 0xff, 3];
+        let quoted = super::quote_null_bytes(bytes.clone().into());
+        assert_eq!(vec![0xff, 0u8, 1, 0xff, 0xff, 0, 2, 0xff, 0xff, 3], quoted);
+        let unquoted = super::unquote_null_bytes(quoted);
+        assert_eq!(bytes, unquoted.into_iter().collect::<Vec<u8>>());
+    }
 
     #[tokio::test]
     async fn test_compact() {

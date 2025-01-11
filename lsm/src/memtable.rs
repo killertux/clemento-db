@@ -16,6 +16,9 @@ impl Memtable {
 
     pub fn put(&mut self, key: Cow<'_, Bytes>, value: Value) {
         let key_size = key.len();
+        if key_size == 0 {
+            return;
+        }
         let value_size = value.size();
         match self.data.binary_search_by(|entry| entry.0.cmp(&key)) {
             Ok(index) => {
