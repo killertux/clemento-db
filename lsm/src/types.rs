@@ -1,4 +1,4 @@
-use std::{ops::BitAnd, u8};
+use std::ops::BitAnd;
 
 use bytes::{BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -30,7 +30,7 @@ impl UVarInt {
             let byte = byte & 0b01111111;
             result |= (byte as u128) << (7 * i);
         }
-        return Ok(if result <= u8::MAX as u128 {
+        Ok(if result <= u8::MAX as u128 {
             UVarInt::U8(result as u8)
         } else if result <= u16::MAX as u128 {
             UVarInt::U16(result as u16)
@@ -40,7 +40,7 @@ impl UVarInt {
             UVarInt::U64(result as u64)
         } else {
             UVarInt::U128(result)
-        });
+        })
     }
 
     pub async fn write<W>(mut self, writer: &mut W) -> Result<usize, std::io::Error>
@@ -61,7 +61,7 @@ impl UVarInt {
             }
         }
         let bytes_written = bytes.len();
-        for byte in (*bytes).into_iter().rev() {
+        for byte in (*bytes).iter().rev() {
             writer.write_u8(*byte).await?;
         }
         Ok(bytes_written)
@@ -234,7 +234,12 @@ impl Fixed28BitsInt {
         writer.write_u8((self.0 >> 21) as u8 | 0b10000000).await?;
         writer.write_u8((self.0 >> 14) as u8 | 0b10000000).await?;
         writer.write_u8((self.0 >> 7) as u8 | 0b10000000).await?;
-        writer.write_u8(self.0 as u8 | 0b10000000).await?;
+        let last_byte = self.0 as u8 | 0b10000000;
+        if last_byte == 0xFF {
+            writer.write_u8(0x7F).await?;
+        } else {
+            writer.write_u8(self.0 as u8 | 0b10000000).await?;
+        }
         Ok(())
     }
 
@@ -283,7 +288,12 @@ impl Fixed56BitsInt {
         writer.write_u8((self.0 >> 21) as u8 | 0b10000000).await?;
         writer.write_u8((self.0 >> 14) as u8 | 0b10000000).await?;
         writer.write_u8((self.0 >> 7) as u8 | 0b10000000).await?;
-        writer.write_u8(self.0 as u8 | 0b10000000).await?;
+        let last_byte = self.0 as u8 | 0b10000000;
+        if last_byte == 0xFF {
+            writer.write_u8(0x7F).await?;
+        } else {
+            writer.write_u8(self.0 as u8 | 0b10000000).await?;
+        }
         Ok(())
     }
 
@@ -365,6 +375,17 @@ mod test {
     }
 
     #[tokio::test]
+    async fn fixed_21_bits_last_byte_is_ff() {
+        let mut buffer = Vec::new();
+        let fixed_int = Fixed28BitsInt::new(0x7F);
+        fixed_int.write(&mut buffer).await.unwrap();
+        let mut buffer = &buffer[..];
+        assert_eq!([0x80, 0x80, 0x80, 0x7f], buffer);
+        let fixed_int = Fixed28BitsInt::read(&mut buffer).await.unwrap();
+        assert_eq!(fixed_int.value(), 0x7F);
+    }
+
+    #[tokio::test]
     async fn write_and_read_fixed_56_bits_int() {
         let mut buffer = Vec::new();
         let fixed_int = Fixed56BitsInt::new(Fixed56BitsInt::MAX);
@@ -372,5 +393,16 @@ mod test {
         let mut buffer = &buffer[..];
         let fixed_int = Fixed56BitsInt::read(&mut buffer).await.unwrap();
         assert_eq!(fixed_int.value(), Fixed56BitsInt::MAX);
+    }
+
+    #[tokio::test]
+    async fn fixed_56_bits_last_byte_is_ff() {
+        let mut buffer = Vec::new();
+        let fixed_int = Fixed56BitsInt::new(0x7F);
+        fixed_int.write(&mut buffer).await.unwrap();
+        let mut buffer = &buffer[..];
+        assert_eq!([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f], buffer);
+        let fixed_int = Fixed56BitsInt::read(&mut buffer).await.unwrap();
+        assert_eq!(fixed_int.value(), 0x7F);
     }
 }

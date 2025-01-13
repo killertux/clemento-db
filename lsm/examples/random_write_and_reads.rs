@@ -1,10 +1,13 @@
 use lsm::LSM;
-use rand::seq::SliceRandom;
+use rand::{seq::SliceRandom, thread_rng};
 use std::borrow::Cow;
 
 #[tokio::main]
 pub async fn main() -> Result<(), std::io::Error> {
-    let mut lsm = LSM::new(512 * 1024, 2, "./".to_string());
+    let mut lsm = LSM::new(16 * 1024 * 1024, 2, "./".to_string())
+        .await
+        .unwrap();
+
     let mut keys = vec![0u64];
     let n_operations = 1000000;
     let start_key = 0u64;
@@ -22,8 +25,7 @@ pub async fn main() -> Result<(), std::io::Error> {
     for _ in 0..n_operations {
         let read_operation: bool = rand::random();
         if read_operation {
-            let key = keys.choose(&mut rand::thread_rng()).unwrap();
-            // println!("Getting key {key}");
+            let key = keys.choose(&mut thread_rng()).unwrap();
             let start = std::time::Instant::now();
             let value = lsm.get(&key.to_be_bytes().to_vec().into()).await.unwrap();
             let elapsed = start.elapsed().as_millis() as u64;
@@ -36,7 +38,6 @@ pub async fn main() -> Result<(), std::io::Error> {
             }
         } else {
             let key: u64 = rand::random();
-            // println!("Writting key {key}");
             let value = format!("Value for key {}#", key);
             let start = std::time::Instant::now();
             lsm.put(Cow::Owned(key.to_be_bytes().to_vec().into()), value.into())

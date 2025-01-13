@@ -35,7 +35,7 @@ impl Memtable {
     }
 
     pub fn get(&self, key: &Bytes) -> Option<&Value> {
-        match self.data.binary_search_by(|entry| entry.0.cmp(&key)) {
+        match self.data.binary_search_by(|entry| entry.0.cmp(key)) {
             Ok(index) => Some(&self.data[index].1),
             Err(_) => None,
         }

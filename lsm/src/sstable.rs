@@ -12,6 +12,7 @@ use tokio::{
 use crate::{
     memtable::{Key, Memtable, Value},
     types::{Fixed28BitsInt, Fixed56BitsInt, UVarInt},
+    MapErrIntoOtherError,
 };
 
 pub struct SSTable {
@@ -28,7 +29,7 @@ impl SSTable {
     ) -> Result<Self, ErrorCreatingSSTable> {
         let data = memtable.data();
         let mut bloom_filter = Bloom::new_for_fp_rate(data.len(), BLOOM_FILTER_FP)
-            .map_err(|err| ErrorCreatingSSTable::BloomFilterError(err))?;
+            .map_err(ErrorCreatingSSTable::BloomFilterError)?;
         data.iter().for_each(|entry| bloom_filter.set(&entry.0));
         let metadata = SSTableMetadata {
             bloom_filter,
@@ -122,11 +123,11 @@ impl SSTable {
                         if mid == start {
                             return Ok(None);
                         }
-                        mid += 1;
-                        if mid > end  {
+                        if mid > end {
                             end = initial_mid;
                             continue 'external;
                         }
+                        mid += 1;
                     }
                     Err(err) if matches!(err.kind(), ErrorKind::UnexpectedEof) => {
                         end = initial_mid;
@@ -146,15 +147,8 @@ impl SSTable {
                 keys_file.read_exact(&mut key).await?;
                 unquote_null_bytes(key.into())
             };
-            let n_loaded_key = u64::from_be_bytes(loaded_key.as_ref().try_into().unwrap());
-            let n_key = u64::from_be_bytes(key.as_ref().try_into().unwrap());
-            println!(
-                "{},{},{},{}",
-                n_loaded_key,
-                n_key,
-                n_loaded_key < n_key,
-                loaded_key < *key
-            );
+            // dbg!(key);
+            // dbg!(&loaded_key);
             if loaded_key == *key {
                 let value_pos: usize = Fixed56BitsInt::read(&mut keys_file)
                     .await?
@@ -178,10 +172,13 @@ impl SSTable {
                 values_file.read_exact(&mut value).await?;
                 return Ok(Some(Value::Data(value.into())));
             }
+            if start == mid {
+                return Ok(None);
+            }
             if loaded_key < *key {
-                start = keys_file.seek(SeekFrom::Current(0)).await?;
+                start = initial_mid;
             } else {
-                end = keys_file.seek(SeekFrom::Current(0)).await?;
+                end = initial_mid;
             }
         }
     }
@@ -266,7 +263,7 @@ impl SSTable {
                         .write(&mut values_file)
                         .await?;
                     values_cursor += value.len();
-                    values_file.write_all(&value).await?;
+                    values_file.write_all(value).await?;
                 }
                 Value::TombStone => {
                     values_cursor += UVarInt::try_from(0)
@@ -286,7 +283,7 @@ impl SSTable {
         keys_file.flush().await?;
         values_file.flush().await?;
         let mut bloom_filter = Bloom::new_for_fp_rate(n_entries, BLOOM_FILTER_FP)
-            .map_err(|err| ErrorCreatingSSTable::BloomFilterError(err))?;
+            .map_err(ErrorCreatingSSTable::BloomFilterError)?;
         {
             let mut file = keys_file.into_inner();
             file.seek(SeekFrom::Start(0)).await?;
@@ -413,7 +410,7 @@ where
 }
 
 #[derive(Debug)]
-pub struct KeyReader<R> {
+struct KeyReader<R> {
     pub keys_reader: R,
     pub n_entries: u64,
     pub read_entries: u64,
@@ -506,11 +503,7 @@ impl SSTableMetadata {
     }
 
     pub fn check(&self, key: &Key) -> bool {
-        self.bloom_filter.check(&key)
-    }
-
-    pub fn n_entries(&self) -> u64 {
-        self.n_entries
+        self.bloom_filter.check(key)
     }
 
     async fn store(&self, base_path: &str) -> Result<(), std::io::Error> {
@@ -529,13 +522,12 @@ impl SSTableMetadata {
         file.write_all(bloom_filter_slice).await?;
         file.write_u8(self.level).await?;
         file.write_u64(self.file_id).await?;
-        file.write_u64(self.n_entries).await
+        file.write_u64(self.n_entries).await?;
+        file.flush().await
     }
 
-    pub async fn read(base_path: &str, level: u8, file_id: u64) -> Result<Self, std::io::Error> {
-        let mut file = BufReader::new(
-            File::open(format!("{base_path}/{}_{:08}.sst_metadata", level, file_id)).await?,
-        );
+    pub async fn read_from_file(file: &str) -> Result<Self, std::io::Error> {
+        let mut file = BufReader::new(File::open(file).await?);
         let bloom_filter_size = UVarInt::read(&mut file).await?;
         let bloom_filter_size: usize = bloom_filter_size.try_into().map_err_into_other_error()?;
         let mut bloom_filter = vec![0u8; bloom_filter_size];
@@ -550,19 +542,6 @@ impl SSTableMetadata {
             file_id,
             n_entries,
         })
-    }
-}
-
-trait MapErrIntoOtherError<T, E> {
-    fn map_err_into_other_error(self) -> Result<T, std::io::Error>;
-}
-
-impl<T, E> MapErrIntoOtherError<T, E> for Result<T, E>
-where
-    E: ToString,
-{
-    fn map_err_into_other_error(self) -> Result<T, std::io::Error> {
-        self.map_err(|err| std::io::Error::new(ErrorKind::Other, err.to_string()))
     }
 }
 
