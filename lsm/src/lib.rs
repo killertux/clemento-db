@@ -2,8 +2,10 @@ use std::{borrow::Cow, collections::HashMap};
 
 use bytes::Bytes;
 use memtable::{Memtable, Value};
-use sstable::{ErrorCreatingSSTable, SSTable, SSTableCompactError, SSTableMetadata};
+use sstable::{ErrorCreatingSSTable, SSTable, SSTableCompactError};
 use thiserror::Error;
+
+pub use sstable::{KeyReader, SSTableMetadata};
 
 mod memtable;
 mod sstable;

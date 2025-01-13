@@ -108,6 +108,7 @@ impl SSTable {
         let mut end = keys_file.seek(SeekFrom::End(0)).await?;
         'external: loop {
             let mut mid = (start + end) / 2;
+            // dbg!(start, mid, end);
             let initial_mid = mid;
             let pos = keys_file.seek(SeekFrom::Start(mid)).await?;
             let mut old_bytes = None;
@@ -122,7 +123,7 @@ impl SSTable {
                             return Ok(None);
                         }
                         mid += 1;
-                        if mid > end {
+                        if mid > end  {
                             end = initial_mid;
                             continue 'external;
                         }
@@ -178,9 +179,9 @@ impl SSTable {
                 return Ok(Some(Value::Data(value.into())));
             }
             if loaded_key < *key {
-                start = initial_mid;
+                start = keys_file.seek(SeekFrom::Current(0)).await?;
             } else {
-                end = initial_mid;
+                end = keys_file.seek(SeekFrom::Current(0)).await?;
             }
         }
     }
@@ -412,17 +413,17 @@ where
 }
 
 #[derive(Debug)]
-struct KeyReader<R> {
-    keys_reader: R,
-    n_entries: u64,
-    read_entries: u64,
+pub struct KeyReader<R> {
+    pub keys_reader: R,
+    pub n_entries: u64,
+    pub read_entries: u64,
 }
 
 impl<R> KeyReader<R>
 where
     R: AsyncRead + Unpin,
 {
-    async fn read(&mut self) -> Result<Option<Key>, std::io::Error> {
+    pub async fn read(&mut self) -> Result<Option<Key>, std::io::Error> {
         if self.read_entries == self.n_entries {
             return Ok(None);
         }
@@ -508,6 +509,10 @@ impl SSTableMetadata {
         self.bloom_filter.check(&key)
     }
 
+    pub fn n_entries(&self) -> u64 {
+        self.n_entries
+    }
+
     async fn store(&self, base_path: &str) -> Result<(), std::io::Error> {
         let mut file = BufWriter::new(
             File::create(format!(
@@ -525,6 +530,26 @@ impl SSTableMetadata {
         file.write_u8(self.level).await?;
         file.write_u64(self.file_id).await?;
         file.write_u64(self.n_entries).await
+    }
+
+    pub async fn read(base_path: &str, level: u8, file_id: u64) -> Result<Self, std::io::Error> {
+        let mut file = BufReader::new(
+            File::open(format!("{base_path}/{}_{:08}.sst_metadata", level, file_id)).await?,
+        );
+        let bloom_filter_size = UVarInt::read(&mut file).await?;
+        let bloom_filter_size: usize = bloom_filter_size.try_into().map_err_into_other_error()?;
+        let mut bloom_filter = vec![0u8; bloom_filter_size];
+        file.read_exact(&mut bloom_filter).await?;
+        let bloom_filter = Bloom::from_slice(&bloom_filter).map_err_into_other_error()?;
+        let level = file.read_u8().await?;
+        let file_id = file.read_u64().await?;
+        let n_entries = file.read_u64().await?;
+        Ok(Self {
+            bloom_filter,
+            level,
+            file_id,
+            n_entries,
+        })
     }
 }
 
