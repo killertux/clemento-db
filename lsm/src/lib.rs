@@ -5,7 +5,10 @@ use memtable::{Memtable, Value};
 use sstable::{ErrorCreatingSSTable, SSTable, SSTableCompactError, SSTableMetadata};
 use thiserror::Error;
 
-use tokio::fs::read_dir;
+use tokio::{
+    fs::{read_dir, File},
+    io::{AsyncWriteExt, BufWriter},
+};
 
 mod memtable;
 mod sstable;
@@ -33,6 +36,7 @@ impl LSM {
     ) -> Result<Self, LsmError> {
         let mut read_dir = read_dir(&base_path).await?;
         let mut metadatas = Vec::new();
+        let mut memtable = None;
         while let Some(entry) = read_dir.next_entry().await? {
             let path = entry.path();
             if path.is_file() {
@@ -41,18 +45,18 @@ impl LSM {
                     .map(|file_name| file_name.ends_with(".sst_metadata"))
                     .unwrap_or(false)
                 {
-                    let file_name = file_name.ok_or(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Invalid filename",
-                    ))?;
-                    let metadata = SSTableMetadata::read_from_file(file_name).await?;
+                    let metadata = SSTableMetadata::read_from_file(path).await?;
                     metadatas.push(metadata);
+                } else if file_name == Some("memtable") {
+                    let mut file = File::open(path).await?;
+                    memtable = Some(Memtable::read(&mut file).await?);
                 }
             }
         }
         let mut n_sstables = 0;
         let mut max_level = 0;
         let mut sstable_metadatas = HashMap::new();
+        metadatas.sort_by(|a, b| a.file_id().cmp(&b.file_id()));
         for metadata in metadatas {
             n_sstables += 1;
             max_level = max_level.max(metadata.level());
@@ -64,7 +68,7 @@ impl LSM {
         Ok(Self {
             max_memtable_size,
             max_sstables_per_level,
-            memtable: Memtable::new(),
+            memtable: memtable.unwrap_or_else(Memtable::new),
             sstable_metadatas,
             n_sstables,
             max_level,
@@ -109,6 +113,22 @@ impl LSM {
         self.internal_put(key, value).await
     }
 
+    pub async fn close(mut self) -> Result<(), LsmError> {
+        let base_path = self.base_path.clone();
+        let memtable = std::mem::replace(&mut self.memtable, Memtable::new());
+        Self::write_memtable(memtable, base_path).await
+    }
+
+    async fn write_memtable(memtable: Memtable, base_path: String) -> Result<(), LsmError> {
+        if memtable.size() == 0 {
+            return Ok(());
+        }
+        let mut file = BufWriter::new(File::create(format!("{}/memtable", base_path)).await?);
+        memtable.write(&mut file).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
     async fn internal_put(&mut self, key: Cow<'_, Bytes>, value: Value) -> Result<(), LsmError> {
         self.memtable.put(key, value);
         if self.memtable.size() >= self.max_memtable_size {
@@ -150,6 +170,16 @@ impl LSM {
         self.store_metadata_and_compact_if_necessary(metadata)
             .await?;
         Ok(())
+    }
+}
+
+impl Drop for LSM {
+    fn drop(&mut self) {
+        let base_path = self.base_path.clone();
+        let memtable = std::mem::replace(&mut self.memtable, Memtable::new());
+        tokio::spawn(async move {
+            let _ = LSM::write_memtable(memtable, base_path).await;
+        });
     }
 }
 
@@ -441,6 +471,68 @@ mod tests {
         assert_eq!(
             lsm.get(&key_5).await.unwrap().unwrap().into_owned(),
             value_5
+        );
+    }
+
+    #[tokio::test]
+    async fn test_should_restore_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lsm = LSM::new(20, 10, temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+        let key_1 = Bytes::from("key 1");
+        let key_2 = Bytes::from("key 2");
+        let key_3 = Bytes::from("key 3");
+        let key_4 = Bytes::from("key 4");
+        let value_1 = Bytes::from("v1");
+        let value_2 = Bytes::from("v2");
+        let value_3 = Bytes::from("v3");
+        let value_4 = Bytes::from("v4");
+
+        lsm.put(Cow::Borrowed(&key_1), value_1.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_2), value_2.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_3), value_3.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_4), value_4.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_2), value_3.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_3), value_2.clone())
+            .await
+            .unwrap();
+        lsm.put(Cow::Borrowed(&key_4), value_1.clone())
+            .await
+            .unwrap();
+
+        lsm.close().await.unwrap();
+        let lsm = LSM::new(20, 10, temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(lsm.sstable_metadatas[&0].len(), 2);
+        assert_eq!(lsm.n_sstables, 2);
+        assert_eq!(
+            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
+            value_1
+        );
+        assert_eq!(
+            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
+            value_3
+        );
+        assert_eq!(
+            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
+            value_2
+        );
+        assert_eq!(
+            lsm.get(&key_4).await.unwrap().unwrap().into_owned(),
+            value_1
         );
     }
 }

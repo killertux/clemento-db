@@ -1,6 +1,10 @@
 use bytes::Bytes;
 use std::borrow::Cow;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::{types::UVarInt, MapErrIntoOtherError};
+
+#[derive(Debug, Clone)]
 pub(crate) struct Memtable {
     size: usize,
     data: Vec<(Key, Value)>,
@@ -48,6 +52,55 @@ impl Memtable {
     pub fn data(self) -> Vec<(Key, Value)> {
         self.data
     }
+
+    pub async fn write<W>(&self, writer: &mut W) -> Result<(), std::io::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        UVarInt::try_from(self.size)
+            .map_err_into_other_error()?
+            .write(writer)
+            .await?;
+        UVarInt::try_from(self.data.len())
+            .map_err_into_other_error()?
+            .write(writer)
+            .await?;
+        for (key, value) in self.data.iter() {
+            UVarInt::try_from(key.len())
+                .map_err_into_other_error()?
+                .write(writer)
+                .await?;
+            writer.write_all(&key).await?;
+            value.write(writer).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn read<R>(reader: &mut R) -> Result<Self, std::io::Error>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let size = UVarInt::read(reader)
+            .await?
+            .try_into()
+            .map_err_into_other_error()?;
+        let data_size = UVarInt::read(reader)
+            .await?
+            .try_into()
+            .map_err_into_other_error()?;
+        let mut data = Vec::with_capacity(data_size);
+        for _ in 0..data_size {
+            let key_size = UVarInt::read(reader)
+                .await?
+                .try_into()
+                .map_err_into_other_error()?;
+            let mut key = vec![0; key_size];
+            reader.read_exact(&mut key).await?;
+            let value = Value::read(reader).await?;
+            data.push((key.into(), value));
+        }
+        Ok(Self { size, data })
+    }
 }
 
 pub(crate) type Key = Bytes;
@@ -64,6 +117,42 @@ impl Value {
             Value::TombStone => 1,
             Value::Data(value) => value.len(),
         }
+    }
+
+    pub async fn write<W>(&self, writer: &mut W) -> Result<usize, std::io::Error>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        Ok(match self {
+            Value::TombStone => {
+                UVarInt::try_from(0)
+                    .map_err_into_other_error()?
+                    .write(writer)
+                    .await?
+            }
+            Value::Data(value) => {
+                let size = UVarInt::try_from(value.len() + 1)
+                    .map_err_into_other_error()?
+                    .write(writer)
+                    .await?;
+                writer.write_all(&value).await?;
+                size + value.len()
+            }
+        })
+    }
+
+    pub async fn read<R>(reader: &mut R) -> Result<Self, std::io::Error>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let size = UVarInt::read(reader).await?;
+        if size.is_zero() {
+            return Ok(Value::TombStone);
+        }
+        let size: usize = size.try_into().map_err_into_other_error()?;
+        let mut value = vec![0; size - 1];
+        reader.read_exact(&mut value).await?;
+        Ok(Value::Data(value.into()))
     }
 }
 
