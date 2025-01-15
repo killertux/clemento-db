@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, io::ErrorKind};
+use std::{borrow::Cow, collections::HashMap, io::ErrorKind, sync::Arc};
 
 use bytes::Bytes;
 use memtable::{Memtable, Value};
@@ -8,19 +8,33 @@ use thiserror::Error;
 use tokio::{
     fs::{read_dir, File},
     io::{AsyncWriteExt, BufWriter},
+    sync::{
+        mpsc::{channel, error::SendError, Receiver, Sender},
+        Mutex, RwLock,
+    },
+    task::{JoinError, JoinHandle},
 };
 
 mod memtable;
 mod sstable;
 mod types;
 
+type JoinHandleGuard = Arc<Mutex<Option<JoinHandle<Result<(), LsmError>>>>>;
+#[derive(Debug, Clone)]
 pub struct LSM {
-    max_sstables_per_level: usize,
     max_memtable_size: usize,
+    base_path: String,
+    worker_tx: Sender<WorkerCommands>,
+    join_handle: JoinHandleGuard,
+    inner: Arc<RwLock<InnerLSM>>,
+    temp_memtable: Arc<RwLock<Option<Memtable>>>,
+}
+
+#[derive(Debug)]
+struct InnerLSM {
     memtable: Memtable,
     sstable_metadatas: HashMap<u8, Vec<SSTableMetadata>>,
     n_sstables: u64,
-    base_path: String,
     max_level: u8,
 }
 
@@ -56,7 +70,7 @@ impl LSM {
         let mut n_sstables = 0;
         let mut max_level = 0;
         let mut sstable_metadatas = HashMap::new();
-        metadatas.sort_by(|a, b| a.file_id().cmp(&b.file_id()));
+        metadatas.sort_by_key(|a| a.file_id());
         for metadata in metadatas {
             n_sstables += 1;
             max_level = max_level.max(metadata.level());
@@ -65,14 +79,32 @@ impl LSM {
                 .or_insert_with(Vec::new)
                 .push(metadata);
         }
-        Ok(Self {
-            max_memtable_size,
-            max_sstables_per_level,
+
+        let inner = Arc::new(RwLock::new(InnerLSM {
             memtable: memtable.unwrap_or_else(Memtable::new),
             sstable_metadatas,
             n_sstables,
             max_level,
+        }));
+        let temp_memtable = Arc::new(RwLock::new(None));
+
+        let (tx, rx) = channel(1024);
+        let join_handle = tokio::spawn(Self::worker(
+            rx,
+            tx.clone(),
+            base_path.clone(),
+            max_sstables_per_level,
+            temp_memtable.clone(),
+            inner.clone(),
+        ));
+
+        Ok(Self {
+            max_memtable_size,
             base_path,
+            join_handle: Arc::new(Mutex::new(Some(join_handle))),
+            worker_tx: tx,
+            inner,
+            temp_memtable,
         })
     }
 
@@ -81,29 +113,42 @@ impl LSM {
         self.internal_put(key, value).await
     }
 
-    pub async fn get(&self, key: &Bytes) -> Result<Option<Cow<'_, Bytes>>, LsmError> {
-        match self.memtable.get(key) {
-            Some(Value::Data(value)) => Ok(Some(Cow::Borrowed(value))),
+    pub async fn get(&self, key: &Bytes) -> Result<Option<Bytes>, LsmError> {
+        let temp_memtable = self.temp_memtable.read().await;
+        match temp_memtable
+            .as_ref()
+            .and_then(|memtable| memtable.get(key))
+        {
+            Some(Value::Data(value)) => Ok(Some(value.clone())),
             Some(Value::TombStone) => Ok(None),
             None => {
-                for level in 0..=self.max_level {
-                    if let Some(metadatas) = self.sstable_metadatas.get(&level) {
-                        for metadata in metadatas.iter().rev() {
-                            if metadata.check(key) {
-                                match SSTable::load_value(metadata, &self.base_path, key).await? {
-                                    Some(Value::TombStone) => return Ok(None),
-                                    Some(Value::Data(value)) => {
-                                        return Ok(Some(Cow::Owned(value)));
+                let inner = self.inner.read().await;
+                match inner.memtable.get(key) {
+                    Some(Value::Data(value)) => Ok(Some(value.clone())),
+                    Some(Value::TombStone) => Ok(None),
+                    None => {
+                        for level in 0..=inner.max_level {
+                            if let Some(metadatas) = inner.sstable_metadatas.get(&level) {
+                                for metadata in metadatas.iter().rev() {
+                                    if metadata.check(key) {
+                                        match SSTable::load_value(metadata, &self.base_path, key)
+                                            .await?
+                                        {
+                                            Some(Value::TombStone) => return Ok(None),
+                                            Some(Value::Data(value)) => {
+                                                return Ok(Some(value));
+                                            }
+                                            None => continue,
+                                        }
                                     }
-                                    None => continue,
                                 }
+                            } else {
+                                continue;
                             }
                         }
-                    } else {
-                        continue;
+                        Ok(None)
                     }
                 }
-                Ok(None)
             }
         }
     }
@@ -113,9 +158,16 @@ impl LSM {
         self.internal_put(key, value).await
     }
 
-    pub async fn close(mut self) -> Result<(), LsmError> {
+    pub async fn close(self) -> Result<(), LsmError> {
+        self.worker_tx.send(WorkerCommands::Stop).await?;
+        let join_handle = self.join_handle.lock().await.take();
+        match join_handle {
+            Some(join_handle) => join_handle.await?,
+            None => Ok(()),
+        }?;
         let base_path = self.base_path.clone();
-        let memtable = std::mem::replace(&mut self.memtable, Memtable::new());
+        let mut inner = self.inner.write().await;
+        let memtable = std::mem::replace(&mut inner.memtable, Memtable::new());
         Self::write_memtable(memtable, base_path).await
     }
 
@@ -129,56 +181,168 @@ impl LSM {
         Ok(())
     }
 
-    async fn internal_put(&mut self, key: Cow<'_, Bytes>, value: Value) -> Result<(), LsmError> {
-        self.memtable.put(key, value);
-        if self.memtable.size() >= self.max_memtable_size {
-            let memtable = std::mem::replace(&mut self.memtable, Memtable::new());
-            let sstable = SSTable::try_from_memtable(memtable, self.n_sstables)?;
-            self.n_sstables += 1;
-            let metadata = sstable.store_and_return_metadata(&self.base_path).await?;
-            self.store_metadata_and_compact_if_necessary(metadata)
-                .await?;
+    async fn internal_put(&self, key: Cow<'_, Bytes>, value: Value) -> Result<(), LsmError> {
+        let mut temp_memtable = self.temp_memtable.write().await;
+        match temp_memtable.as_mut() {
+            Some(temp_memtable) => {
+                temp_memtable.put(key, value);
+            }
+            None => {
+                let mut inner = self.inner.write().await;
+                inner.memtable.put(key, value);
+                if inner.memtable.size() >= self.max_memtable_size {
+                    *temp_memtable = Some(Memtable::new());
+                    self.worker_tx.send(WorkerCommands::WriteMemtable).await?;
+                }
+            }
         }
         Ok(())
     }
 
-    async fn store_metadata_and_compact_if_necessary(
-        &mut self,
-        metadata: SSTableMetadata,
+    async fn worker(
+        mut rx: Receiver<WorkerCommands>,
+        tx: Sender<WorkerCommands>,
+        base_path: String,
+        max_sstables_per_level: usize,
+        temp_memtable: Arc<RwLock<Option<Memtable>>>,
+        inner: Arc<RwLock<InnerLSM>>,
     ) -> Result<(), LsmError> {
-        let level = metadata.level();
-        self.sstable_metadatas
-            .entry(metadata.level())
-            .or_default()
-            .push(metadata);
-        if self.sstable_metadatas[&level].len() > self.max_sstables_per_level {
-            Box::pin(self.compact(level)).await?;
+        while let Some(command) = rx.recv().await {
+            match command {
+                WorkerCommands::WriteMemtable => {
+                    let (metadata, level) = {
+                        let inner = inner.read().await;
+                        let sstable =
+                            SSTable::try_from_memtable(&inner.memtable, inner.n_sstables)?;
+                        let metadata = sstable.store_and_return_metadata(&base_path).await?;
+                        let level = metadata.level();
+                        (metadata, level)
+                    };
+                    let mut inner = inner.write().await;
+                    let temp_memtable = temp_memtable.write().await.take();
+                    inner.memtable = temp_memtable.unwrap_or_else(Memtable::new);
+                    inner.n_sstables += 1;
+                    inner
+                        .sstable_metadatas
+                        .entry(metadata.level())
+                        .or_default()
+                        .push(metadata);
+                    tx.send(WorkerCommands::CheckCompact(level)).await?;
+                }
+                WorkerCommands::CheckCompact(level) => {
+                    let new_level = level + 1;
+                    let result = {
+                        let inner = inner.read().await;
+                        if inner.sstable_metadatas[&level].len() > max_sstables_per_level {
+                            let metadatas = inner
+                                .sstable_metadatas
+                                .get(&level)
+                                .cloned()
+                                .expect("We know that there are metadatas here");
+
+                            Some((metadatas, inner.n_sstables))
+                        } else {
+                            None
+                        }
+                    };
+                    let result = {
+                        if let Some((metadatas, n_sstables)) = result {
+                            let metadata =
+                                SSTable::compact(&metadatas, &base_path, new_level, n_sstables)
+                                    .await?;
+                            let mut paths_to_delete = Vec::new();
+                            for metadata in metadatas {
+                                paths_to_delete.push(format!(
+                                    "{base_path}/{}_{:08}.sst_keys",
+                                    metadata.level(),
+                                    metadata.file_id()
+                                ));
+                                paths_to_delete.push(format!(
+                                    "{base_path}/{}_{:08}.sst_values",
+                                    metadata.level(),
+                                    metadata.file_id()
+                                ));
+                                paths_to_delete.push(format!(
+                                    "{base_path}/{}_{:08}.sst_metadata",
+                                    metadata.level(),
+                                    metadata.file_id()
+                                ));
+                            }
+                            Some((paths_to_delete, metadata))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((paths_to_delete, metadata)) = result {
+                        let mut inner = inner.write().await;
+                        inner.max_level = inner.max_level.max(new_level);
+                        inner.n_sstables += 1;
+                        inner.sstable_metadatas.remove(&level);
+                        inner
+                            .sstable_metadatas
+                            .entry(metadata.level())
+                            .or_default()
+                            .push(metadata);
+                        tx.send(WorkerCommands::DeletePaths(paths_to_delete))
+                            .await?;
+                        tx.send(WorkerCommands::CheckCompact(new_level)).await?;
+                    }
+                }
+                WorkerCommands::DeletePaths(paths_to_delete) => {
+                    for path in paths_to_delete {
+                        tokio::fs::remove_file(path).await?;
+                    }
+                }
+                WorkerCommands::Stop => {
+                    rx.close();
+                    break;
+                }
+                #[cfg(test)]
+                WorkerCommands::Await(tx) => {
+                    tx.send(()).unwrap();
+                }
+            }
         }
         Ok(())
     }
+}
 
-    async fn compact(&mut self, level: u8) -> Result<(), LsmError> {
-        let metadatas = self
-            .sstable_metadatas
-            .remove(&level)
-            .expect("We know that there are metadatas here");
-        let new_level = level + 1;
-        self.max_level = self.max_level.max(new_level);
-        let metadata =
-            SSTable::compact(&metadatas, &self.base_path, new_level, self.n_sstables).await?;
-        self.n_sstables += 1;
-        self.store_metadata_and_compact_if_necessary(metadata)
-            .await?;
-        Ok(())
+pub enum WorkerCommands {
+    WriteMemtable,
+    CheckCompact(u8),
+    DeletePaths(Vec<String>),
+    Stop,
+    #[cfg(test)]
+    Await(tokio::sync::oneshot::Sender<()>),
+}
+
+impl WorkerCommands {
+    #[cfg(test)]
+    async fn await_worker(tx: &Sender<WorkerCommands>) {
+        let (oneshoot_tx, oneshoot_rx) = tokio::sync::oneshot::channel();
+        tx.send(WorkerCommands::Await(oneshoot_tx)).await.unwrap();
+        oneshoot_rx.await.unwrap();
     }
 }
 
 impl Drop for LSM {
     fn drop(&mut self) {
+        let inner = self.inner.clone();
+        let worker_tx = self.worker_tx.clone();
+        let join_handle = self.join_handle.clone();
         let base_path = self.base_path.clone();
-        let memtable = std::mem::replace(&mut self.memtable, Memtable::new());
         tokio::spawn(async move {
-            let _ = LSM::write_memtable(memtable, base_path).await;
+            let mut inner = inner.write().await;
+            worker_tx.send(WorkerCommands::Stop).await?;
+            let join_handle = join_handle.lock().await.take();
+            match join_handle {
+                Some(join_handle) => join_handle.await?,
+                None => Ok(()),
+            }
+            .expect("Error closing worker");
+            let base_path = base_path.clone();
+            let memtable = std::mem::replace(&mut inner.memtable, Memtable::new());
+            Self::write_memtable(memtable, base_path).await
         });
     }
 }
@@ -204,6 +368,10 @@ pub enum LsmError {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     SSTableCompactError(#[from] SSTableCompactError),
+    #[error(transparent)]
+    SendError(#[from] SendError<WorkerCommands>),
+    #[error(transparent)]
+    JoinError(#[from] JoinError),
 }
 
 #[cfg(test)]
@@ -223,7 +391,7 @@ mod tests {
         let key = Bytes::from("key");
         let value = Bytes::from("value");
         lsm.put(Cow::Borrowed(&key), value.clone()).await.unwrap();
-        assert_eq!(lsm.get(&key).await.unwrap().unwrap().into_owned(), value);
+        assert_eq!(lsm.get(&key).await.unwrap().unwrap(), value);
     }
 
     #[tokio::test]
@@ -234,7 +402,7 @@ mod tests {
         let value_2 = Bytes::from("value 2");
         lsm.put(Cow::Borrowed(&key), value_1.clone()).await.unwrap();
         lsm.put(Cow::Borrowed(&key), value_2.clone()).await.unwrap();
-        assert_eq!(lsm.get(&key).await.unwrap().unwrap().into_owned(), value_2);
+        assert_eq!(lsm.get(&key).await.unwrap().unwrap(), value_2);
     }
 
     #[tokio::test]
@@ -265,18 +433,9 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_3), value_3.clone())
             .await
             .unwrap();
-        assert_eq!(
-            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
-        assert_eq!(
-            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
-            value_2
-        );
-        assert_eq!(
-            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
-            value_3
-        );
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_2);
+        assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_3);
     }
 
     #[tokio::test]
@@ -297,23 +456,15 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_2), value_2.clone())
             .await
             .unwrap();
-        assert_eq!(lsm.memtable.size(), 0);
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
         lsm.put(Cow::Borrowed(&key_3), value_3.clone())
             .await
             .unwrap();
-        assert_eq!(lsm.memtable.size(), 7);
-        assert_eq!(
-            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
-        assert_eq!(
-            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
-            value_2
-        );
-        assert_eq!(
-            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
-            value_3
-        );
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
+        assert_eq!(lsm.inner.read().await.memtable.size(), 7);
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_2);
+        assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_3);
     }
 
     #[tokio::test]
@@ -338,16 +489,11 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_3), value_3.clone())
             .await
             .unwrap();
-        assert_eq!(lsm.memtable.size(), 0);
-        assert_eq!(
-            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
+        assert_eq!(lsm.inner.read().await.memtable.size(), 0);
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
         assert_eq!(lsm.get(&key_2).await.unwrap(), None);
-        assert_eq!(
-            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
-            value_3
-        );
+        assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_3);
     }
 
     #[tokio::test]
@@ -377,6 +523,7 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_4), value_4.clone())
             .await
             .unwrap();
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
         lsm.put(Cow::Borrowed(&key_2), value_3.clone())
             .await
             .unwrap();
@@ -386,25 +533,13 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_4), value_1.clone())
             .await
             .unwrap();
-
-        assert_eq!(lsm.sstable_metadatas[&0].len(), 2);
-        assert_eq!(lsm.n_sstables, 2);
-        assert_eq!(
-            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
-        assert_eq!(
-            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
-            value_3
-        );
-        assert_eq!(
-            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
-            value_2
-        );
-        assert_eq!(
-            lsm.get(&key_4).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
+        assert_eq!(lsm.inner.read().await.sstable_metadatas[&0].len(), 2);
+        assert_eq!(lsm.inner.read().await.n_sstables, 2);
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_3);
+        assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_2);
+        assert_eq!(lsm.get(&key_4).await.unwrap().unwrap(), value_1);
     }
 
     #[tokio::test]
@@ -430,48 +565,36 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_2), value_2.clone())
             .await
             .unwrap();
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
         lsm.put(Cow::Borrowed(&key_3), value_3.clone())
             .await
             .unwrap();
         lsm.put(Cow::Borrowed(&key_4), value_4.clone())
             .await
             .unwrap();
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
         lsm.put(Cow::Borrowed(&key_5), value_5.clone())
             .await
             .unwrap();
         lsm.put(Cow::Borrowed(&key_2), value_3.clone())
             .await
             .unwrap();
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
         lsm.put(Cow::Borrowed(&key_3), value_2.clone())
             .await
             .unwrap();
         lsm.put(Cow::Borrowed(&key_4), value_1.clone())
             .await
             .unwrap();
-
-        assert_eq!(lsm.sstable_metadatas[&0].len(), 1);
-        assert_eq!(lsm.sstable_metadatas[&1].len(), 1);
-        assert_eq!(lsm.n_sstables, 5);
-        assert_eq!(
-            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
-        assert_eq!(
-            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
-            value_3
-        );
-        assert_eq!(
-            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
-            value_2
-        );
-        assert_eq!(
-            lsm.get(&key_4).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
-        assert_eq!(
-            lsm.get(&key_5).await.unwrap().unwrap().into_owned(),
-            value_5
-        );
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
+        assert_eq!(lsm.inner.read().await.sstable_metadatas[&0].len(), 1);
+        assert_eq!(lsm.inner.read().await.sstable_metadatas[&1].len(), 1);
+        assert_eq!(lsm.inner.read().await.n_sstables, 5);
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_3);
+        assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_2);
+        assert_eq!(lsm.get(&key_4).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_5).await.unwrap().unwrap(), value_5);
     }
 
     #[tokio::test]
@@ -510,29 +633,16 @@ mod tests {
         lsm.put(Cow::Borrowed(&key_4), value_1.clone())
             .await
             .unwrap();
-
+        WorkerCommands::await_worker(&lsm.worker_tx).await;
         lsm.close().await.unwrap();
         let lsm = LSM::new(20, 10, temp_dir.path().to_string_lossy().to_string())
             .await
             .unwrap();
-
-        assert_eq!(lsm.sstable_metadatas[&0].len(), 2);
-        assert_eq!(lsm.n_sstables, 2);
-        assert_eq!(
-            lsm.get(&key_1).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
-        assert_eq!(
-            lsm.get(&key_2).await.unwrap().unwrap().into_owned(),
-            value_3
-        );
-        assert_eq!(
-            lsm.get(&key_3).await.unwrap().unwrap().into_owned(),
-            value_2
-        );
-        assert_eq!(
-            lsm.get(&key_4).await.unwrap().unwrap().into_owned(),
-            value_1
-        );
+        assert_eq!(lsm.inner.read().await.sstable_metadatas[&0].len(), 1);
+        assert_eq!(lsm.inner.read().await.n_sstables, 1);
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_3);
+        assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_2);
+        assert_eq!(lsm.get(&key_4).await.unwrap().unwrap(), value_1);
     }
 }

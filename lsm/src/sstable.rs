@@ -27,7 +27,7 @@ const BLOOM_FILTER_FP: f64 = 0.1;
 
 impl SSTable {
     pub fn try_from_memtable(
-        memtable: Memtable,
+        memtable: &Memtable,
         file_id: u64,
     ) -> Result<Self, ErrorCreatingSSTable> {
         let data = memtable.data();
@@ -40,7 +40,10 @@ impl SSTable {
             file_id,
             n_entries: data.len() as u64,
         };
-        Ok(Self { metadata, data })
+        Ok(Self {
+            metadata,
+            data: data.to_vec(),
+        })
     }
 
     pub async fn store_and_return_metadata(
@@ -269,23 +272,6 @@ impl SSTable {
             n_entries: n_entries as u64,
         };
         metadata.store(base_path).await?;
-        for metadata in metadatas {
-            tokio::fs::remove_file(format!(
-                "{base_path}/{}_{:08}.sst_keys",
-                metadata.level, metadata.file_id
-            ))
-            .await?;
-            tokio::fs::remove_file(format!(
-                "{base_path}/{}_{:08}.sst_values",
-                metadata.level, metadata.file_id
-            ))
-            .await?;
-            tokio::fs::remove_file(format!(
-                "{base_path}/{}_{:08}.sst_metadata",
-                metadata.level, metadata.file_id
-            ))
-            .await?;
-        }
         Ok(metadata)
     }
 
@@ -447,7 +433,7 @@ pub enum SSTableCompactError {
     IOError(#[from] std::io::Error),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SSTableMetadata {
     bloom_filter: Bloom<Key>,
     level: u8,
@@ -534,11 +520,11 @@ mod test {
         memtable.put(Cow::Borrowed(&key1), Value::Data(Bytes::from("value1")));
         memtable.put(Cow::Borrowed(&key2), Value::Data(Bytes::from("value2")));
         memtable.put(Cow::Borrowed(&key3), Value::Data(Bytes::from("value3")));
-        let sstable1 = SSTable::try_from_memtable(memtable, 1).unwrap();
+        let sstable1 = SSTable::try_from_memtable(&memtable, 1).unwrap();
         let mut memtable = Memtable::new();
         memtable.put(Cow::Borrowed(&key1), Value::Data(Bytes::from("value10")));
         memtable.put(Cow::Borrowed(&key2), Value::TombStone);
-        let sstable2 = SSTable::try_from_memtable(memtable, 2).unwrap();
+        let sstable2 = SSTable::try_from_memtable(&memtable, 2).unwrap();
         let metadata_1 = sstable1.store_and_return_metadata(base_path).await.unwrap();
         let metadata_2 = sstable2.store_and_return_metadata(base_path).await.unwrap();
         let metadata = SSTable::compact(&[metadata_1, metadata_2], base_path, 1, 3)

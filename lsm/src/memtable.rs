@@ -49,8 +49,8 @@ impl Memtable {
         self.size
     }
 
-    pub fn data(self) -> Vec<(Key, Value)> {
-        self.data
+    pub fn data(&self) -> &[(Key, Value)] {
+        &self.data
     }
 
     pub async fn write<W>(&self, writer: &mut W) -> Result<(), std::io::Error>
@@ -70,7 +70,7 @@ impl Memtable {
                 .map_err_into_other_error()?
                 .write(writer)
                 .await?;
-            writer.write_all(&key).await?;
+            writer.write_all(key).await?;
             value.write(writer).await?;
         }
         Ok(())
@@ -135,7 +135,7 @@ impl Value {
                     .map_err_into_other_error()?
                     .write(writer)
                     .await?;
-                writer.write_all(&value).await?;
+                writer.write_all(value).await?;
                 size + value.len()
             }
         })

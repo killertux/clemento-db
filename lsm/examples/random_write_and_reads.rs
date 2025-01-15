@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 #[tokio::main]
 pub async fn main() -> Result<(), std::io::Error> {
-    let mut lsm = LSM::new(16 * 1024 * 1024, 2, "./".to_string())
+    let mut lsm = LSM::new(4 * 1024 * 1024, 2, "./".to_string())
         .await
         .unwrap();
 
