@@ -4,3 +4,4 @@
 **/*.sst_metadata
 **/*.sst_keys
 **/*.sst_values
+**/memtable
