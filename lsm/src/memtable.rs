@@ -1,10 +1,14 @@
 use bytes::Bytes;
 use std::borrow::Cow;
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{types::UVarInt, MapErrIntoOtherError};
+use crate::{
+    types::{UVarInt, UVartIntConvertError},
+    MapErrIntoOtherError,
+};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct Memtable {
     size: usize,
     data: Vec<(Key, Value)>,
@@ -39,6 +43,7 @@ impl Memtable {
     }
 
     pub fn get(&self, key: &Bytes) -> Option<&Value> {
+        tracing::debug!("Searching for key: {:?} in memtable", key);
         match self.data.binary_search_by(|entry| entry.0.cmp(key)) {
             Ok(index) => Some(&self.data[index].1),
             Err(_) => None,
@@ -53,54 +58,97 @@ impl Memtable {
         &self.data
     }
 
-    pub async fn write<W>(&self, writer: &mut W) -> Result<(), std::io::Error>
+    pub async fn write<W>(&self, writer: &mut W) -> Result<(), WriteMemtableError>
     where
         W: AsyncWrite + Unpin,
     {
-        UVarInt::try_from(self.size)
-            .map_err_into_other_error()?
+        UVarInt::try_from(self.size)?
             .write(writer)
-            .await?;
-        UVarInt::try_from(self.data.len())
-            .map_err_into_other_error()?
+            .await
+            .map_err(WriteMemtableError::WriteSizeError)?;
+        UVarInt::try_from(self.data.len())?
             .write(writer)
-            .await?;
+            .await
+            .map_err(WriteMemtableError::WriteDataSizeError)?;
         for (key, value) in self.data.iter() {
-            UVarInt::try_from(key.len())
-                .map_err_into_other_error()?
+            UVarInt::try_from(key.len())?
                 .write(writer)
-                .await?;
-            writer.write_all(key).await?;
-            value.write(writer).await?;
+                .await
+                .map_err(WriteMemtableError::WriteKeySizeError)?;
+            writer
+                .write_all(key)
+                .await
+                .map_err(WriteMemtableError::WriteKeyError)?;
+            value
+                .write(writer)
+                .await
+                .map_err(WriteMemtableError::WriteValueError)?;
         }
         Ok(())
     }
 
-    pub async fn read<R>(reader: &mut R) -> Result<Self, std::io::Error>
+    pub async fn read<R>(reader: &mut R) -> Result<Self, ReadMemtableError>
     where
         R: AsyncRead + Unpin,
     {
         let size = UVarInt::read(reader)
-            .await?
-            .try_into()
-            .map_err_into_other_error()?;
+            .await
+            .map_err(ReadMemtableError::ReadSizeError)?
+            .try_into()?;
         let data_size = UVarInt::read(reader)
-            .await?
-            .try_into()
-            .map_err_into_other_error()?;
+            .await
+            .map_err(ReadMemtableError::ReadDataSizeError)?
+            .try_into()?;
         let mut data = Vec::with_capacity(data_size);
         for _ in 0..data_size {
             let key_size = UVarInt::read(reader)
-                .await?
-                .try_into()
-                .map_err_into_other_error()?;
+                .await
+                .map_err(ReadMemtableError::ReadKeySizeError)?
+                .try_into()?;
             let mut key = vec![0; key_size];
-            reader.read_exact(&mut key).await?;
-            let value = Value::read(reader).await?;
+            reader
+                .read_exact(&mut key)
+                .await
+                .map_err(ReadMemtableError::ReadKeyError)?;
+            let value = Value::read(reader)
+                .await
+                .map_err(ReadMemtableError::ReadValueError)?;
             data.push((key.into(), value));
         }
         Ok(Self { size, data })
     }
+}
+
+#[derive(Debug, Error)]
+pub enum WriteMemtableError {
+    #[error("Error writing memtable size: `{0}`")]
+    WriteSizeError(std::io::Error),
+    #[error("Error writing memtable data size: `{0}`")]
+    WriteDataSizeError(std::io::Error),
+    #[error("Error writing key size: `{0}`")]
+    WriteKeySizeError(std::io::Error),
+    #[error("Error writing key: `{0}`")]
+    WriteKeyError(std::io::Error),
+    #[error("Error writing value: `{0}`")]
+    WriteValueError(std::io::Error),
+    #[error(transparent)]
+    ConvertError(#[from] UVartIntConvertError),
+}
+
+#[derive(Debug, Error)]
+pub enum ReadMemtableError {
+    #[error("Error reading memtable size: `{0}`")]
+    ReadSizeError(std::io::Error),
+    #[error("Error reading memtable data size: `{0}`")]
+    ReadDataSizeError(std::io::Error),
+    #[error("Error reading key size: `{0}`")]
+    ReadKeySizeError(std::io::Error),
+    #[error("Error reading key: `{0}`")]
+    ReadKeyError(std::io::Error),
+    #[error("Error reading value: `{0}`")]
+    ReadValueError(std::io::Error),
+    #[error(transparent)]
+    ConvertError(#[from] UVartIntConvertError),
 }
 
 pub(crate) type Key = Bytes;

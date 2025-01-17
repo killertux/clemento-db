@@ -1,8 +1,12 @@
 use std::{borrow::Cow, collections::HashMap, io::ErrorKind, sync::Arc};
 
 use bytes::Bytes;
-use memtable::{Memtable, Value};
-use sstable::{ErrorCreatingSSTable, SSTable, SSTableCompactError, SSTableMetadata};
+use flock::Flock;
+use memtable::{Memtable, ReadMemtableError, Value, WriteMemtableError};
+use sstable::{
+    ErrorCreatingSSTable, LoadSStableValueError, SSTable, SSTableCompactError, SSTableMetadata,
+    SaveSStableError,
+};
 use thiserror::Error;
 
 use tokio::{
@@ -15,6 +19,7 @@ use tokio::{
     task::{JoinError, JoinHandle},
 };
 
+mod flock;
 mod memtable;
 mod sstable;
 mod types;
@@ -36,11 +41,12 @@ struct InnerLSM {
     sstable_metadatas: HashMap<u8, Vec<SSTableMetadata>>,
     n_sstables: u64,
     max_level: u8,
+    flock: Option<Flock>,
 }
 
 impl LSM {
-    pub async fn default() -> Result<Self, LsmError> {
-        Self::new(16 * 1024 * 1024, 16, "./".to_string()).await
+    pub async fn default(base_path: String) -> Result<Self, LsmError> {
+        Self::new(16 * 1024 * 1024, 16, base_path).await
     }
 
     pub async fn new(
@@ -48,6 +54,7 @@ impl LSM {
         max_sstables_per_level: usize,
         base_path: String,
     ) -> Result<Self, LsmError> {
+        let flock = Flock::new(&base_path).await?;
         let mut read_dir = read_dir(&base_path).await?;
         let mut metadatas = Vec::new();
         let mut memtable = None;
@@ -59,9 +66,11 @@ impl LSM {
                     .map(|file_name| file_name.ends_with(".sst_metadata"))
                     .unwrap_or(false)
                 {
+                    tracing::debug!("Reading file {} as sst metadata", path.display());
                     let metadata = SSTableMetadata::read_from_file(path).await?;
                     metadatas.push(metadata);
                 } else if file_name == Some("memtable") {
+                    tracing::debug!("Reading file {} as memtable", path.display());
                     let mut file = File::open(path).await?;
                     memtable = Some(Memtable::read(&mut file).await?);
                 }
@@ -79,12 +88,23 @@ impl LSM {
                 .or_insert_with(Vec::new)
                 .push(metadata);
         }
+        tracing::debug!(
+            "Memtable size {}",
+            memtable
+                .as_ref()
+                .map(|memtable| memtable.size())
+                .unwrap_or(0)
+        );
+        tracing::debug!("SSTables metadatas {sstable_metadatas:?}");
+        tracing::debug!("n_sstables {n_sstables}");
+        tracing::debug!("max_level {max_level}");
 
         let inner = Arc::new(RwLock::new(InnerLSM {
             memtable: memtable.unwrap_or_else(Memtable::new),
             sstable_metadatas,
             n_sstables,
             max_level,
+            flock: Some(flock),
         }));
         let temp_memtable = Arc::new(RwLock::new(None));
 
@@ -109,17 +129,23 @@ impl LSM {
     }
 
     pub async fn put(&mut self, key: Cow<'_, Bytes>, value: Bytes) -> Result<(), LsmError> {
+        tracing::debug!("Putting key {:?}", key);
         let value = Value::Data(value);
         self.internal_put(key, value).await
     }
 
     pub async fn get(&self, key: &Bytes) -> Result<Option<Bytes>, LsmError> {
-        let temp_memtable = self.temp_memtable.read().await;
-        match temp_memtable
-            .as_ref()
-            .and_then(|memtable| memtable.get(key))
-        {
-            Some(Value::Data(value)) => Ok(Some(value.clone())),
+        tracing::debug!("Getting key {:?}", key);
+        let result = {
+            let temp_memtable = self.temp_memtable.read().await;
+            temp_memtable.as_ref().and_then(|memtable| {
+                tracing::debug!("Searching for key in temp memtable");
+                memtable.get(key).cloned()
+            })
+        };
+
+        match result {
+            Some(Value::Data(value)) => Ok(Some(value)),
             Some(Value::TombStone) => Ok(None),
             None => {
                 let inner = self.inner.read().await;
@@ -131,9 +157,12 @@ impl LSM {
                             if let Some(metadatas) = inner.sstable_metadatas.get(&level) {
                                 for metadata in metadatas.iter().rev() {
                                     if metadata.check(key) {
+                                        tracing::debug!("BloomFilter positive for key {key:?} in sstable {metadata:?}");
                                         match SSTable::load_value(metadata, &self.base_path, key)
-                                            .await?
-                                        {
+                                            .await
+                                            .map_err(|err| {
+                                                LsmError::LoadSStableValueError(key.clone(), err)
+                                            })? {
                                             Some(Value::TombStone) => return Ok(None),
                                             Some(Value::Data(value)) => {
                                                 return Ok(Some(value));
@@ -154,12 +183,14 @@ impl LSM {
     }
 
     pub async fn delete(&mut self, key: Cow<'_, Bytes>) -> Result<(), LsmError> {
+        tracing::debug!("Deleting key {:?}", key);
         let value = Value::TombStone;
         self.internal_put(key, value).await
     }
 
     pub async fn close(self) -> Result<(), LsmError> {
-        self.worker_tx.send(WorkerCommands::Stop).await?;
+        tracing::debug!("Closing LSM");
+        let _ = self.worker_tx.send(WorkerCommands::Stop).await;
         let join_handle = self.join_handle.lock().await.take();
         match join_handle {
             Some(join_handle) => join_handle.await?,
@@ -168,10 +199,15 @@ impl LSM {
         let base_path = self.base_path.clone();
         let mut inner = self.inner.write().await;
         let memtable = std::mem::replace(&mut inner.memtable, Memtable::new());
-        Self::write_memtable(memtable, base_path).await
+        Self::write_memtable(memtable, base_path).await?;
+        Ok(match inner.flock.take() {
+            Some(flock) => flock.unlock().await?,
+            None => (),
+        })
     }
 
     async fn write_memtable(memtable: Memtable, base_path: String) -> Result<(), LsmError> {
+        tracing::debug!("Writing memtable to disk");
         if memtable.size() == 0 {
             return Ok(());
         }
@@ -210,6 +246,7 @@ impl LSM {
         while let Some(command) = rx.recv().await {
             match command {
                 WorkerCommands::WriteMemtable => {
+                    tracing::debug!("Writing memtable to disk");
                     let (metadata, level) = {
                         let inner = inner.read().await;
                         let sstable =
@@ -247,6 +284,7 @@ impl LSM {
                     };
                     let result = {
                         if let Some((metadatas, n_sstables)) = result {
+                            tracing::debug!("Running compact for level {new_level}");
                             let metadata =
                                 SSTable::compact(&metadatas, &base_path, new_level, n_sstables)
                                     .await?;
@@ -283,9 +321,11 @@ impl LSM {
                             .entry(metadata.level())
                             .or_default()
                             .push(metadata);
+                        tracing::debug!("Compact done. Scheduling delete and new checks");
                         tx.send(WorkerCommands::DeletePaths(paths_to_delete))
                             .await?;
                         tx.send(WorkerCommands::CheckCompact(new_level)).await?;
+                        tracing::debug!("Compact done");
                     }
                 }
                 WorkerCommands::DeletePaths(paths_to_delete) => {
@@ -332,17 +372,23 @@ impl Drop for LSM {
         let join_handle = self.join_handle.clone();
         let base_path = self.base_path.clone();
         tokio::spawn(async move {
-            let mut inner = inner.write().await;
-            worker_tx.send(WorkerCommands::Stop).await?;
+            let _ = worker_tx.send(WorkerCommands::Stop).await;
             let join_handle = join_handle.lock().await.take();
             match join_handle {
-                Some(join_handle) => join_handle.await?,
+                Some(join_handle) => join_handle.await.expect("Error joining worker"),
                 None => Ok(()),
             }
             .expect("Error closing worker");
+            let mut inner = inner.write().await;
             let base_path = base_path.clone();
             let memtable = std::mem::replace(&mut inner.memtable, Memtable::new());
-            Self::write_memtable(memtable, base_path).await
+            Self::write_memtable(memtable, base_path)
+                .await
+                .expect("Error writing memtable");
+            match inner.flock.take() {
+                Some(flock) => flock.unlock().await.expect("Error unlocking file lock"),
+                None => (),
+            }
         });
     }
 }
@@ -362,16 +408,26 @@ where
 
 #[derive(Debug, Error)]
 pub enum LsmError {
-    #[error(transparent)]
+    #[error("Error creating SSTable. `{0}`")]
     ErrorCreatingSSTable(#[from] ErrorCreatingSSTable),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
-    #[error(transparent)]
+    #[error("Error compacting SSTable. `{0}`")]
     SSTableCompactError(#[from] SSTableCompactError),
     #[error(transparent)]
     SendError(#[from] SendError<WorkerCommands>),
     #[error(transparent)]
     JoinError(#[from] JoinError),
+    #[error("Error writing memtable to disk. `{0}`")]
+    WriteMemtableError(#[from] WriteMemtableError),
+    #[error("Error reading memtable from disk. `{0}`")]
+    ReadMemtableError(#[from] ReadMemtableError),
+    #[error("Error saving SSTable. `{0}`")]
+    SaveSStableError(#[from] SaveSStableError),
+    #[error("Error loading SSTable value for key {0:?}. `{1}`")]
+    LoadSStableValueError(Bytes, LoadSStableValueError),
+    #[error("Error with flock. `{0}`")]
+    FlockError(#[from] flock::FlockError),
 }
 
 #[cfg(test)]
@@ -380,14 +436,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_non_existent() {
-        let lsm = LSM::default().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lsm = LSM::default(temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
         let key = Bytes::from("key");
         assert_eq!(lsm.get(&key).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn test_put_get() {
-        let mut lsm = LSM::default().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lsm = LSM::default(temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
         let key = Bytes::from("key");
         let value = Bytes::from("value");
         lsm.put(Cow::Borrowed(&key), value.clone()).await.unwrap();
@@ -396,7 +458,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_existent_should_overwrite() {
-        let mut lsm = LSM::default().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lsm = LSM::default(temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
         let key = Bytes::from("key");
         let value_1 = Bytes::from("value 1");
         let value_2 = Bytes::from("value 2");
@@ -407,7 +472,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_delete_get() {
-        let mut lsm = LSM::default().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lsm = LSM::default(temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
         let key = Bytes::from("key");
         let value = Bytes::from("value");
         lsm.put(Cow::Borrowed(&key), value.clone()).await.unwrap();
@@ -417,7 +485,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_multiples() {
-        let mut lsm = LSM::default().await.unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut lsm = LSM::default(temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
         let key_1 = Bytes::from("key 1");
         let key_2 = Bytes::from("key 2");
         let key_3 = Bytes::from("key 3");
@@ -644,5 +715,32 @@ mod tests {
         assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_3);
         assert_eq!(lsm.get(&key_3).await.unwrap().unwrap(), value_2);
         assert_eq!(lsm.get(&key_4).await.unwrap().unwrap(), value_1);
+    }
+
+    #[tokio::test]
+    async fn test_should_restore_state_if_drop_with_memtable() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let key_1 = Bytes::from("key 1");
+        let key_2 = Bytes::from("key 2");
+        let value_1 = Bytes::from("v1");
+        let value_2 = Bytes::from("v2");
+
+        {
+            let mut lsm = LSM::new(100, 10, temp_dir.path().to_string_lossy().to_string())
+                .await
+                .unwrap();
+            lsm.put(Cow::Borrowed(&key_1), value_1.clone())
+                .await
+                .unwrap();
+            lsm.put(Cow::Borrowed(&key_2), value_2.clone())
+                .await
+                .unwrap();
+        }
+        let lsm = LSM::new(20, 10, temp_dir.path().to_string_lossy().to_string())
+            .await
+            .unwrap();
+        assert_eq!(lsm.inner.read().await.n_sstables, 0);
+        assert_eq!(lsm.get(&key_1).await.unwrap().unwrap(), value_1);
+        assert_eq!(lsm.get(&key_2).await.unwrap().unwrap(), value_2);
     }
 }

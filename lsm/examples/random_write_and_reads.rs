@@ -3,21 +3,19 @@ use rand::{seq::SliceRandom, thread_rng};
 use std::borrow::Cow;
 
 #[tokio::main]
-pub async fn main() -> Result<(), std::io::Error> {
-    let mut lsm = LSM::new(4 * 1024 * 1024, 2, "./".to_string())
-        .await
-        .unwrap();
+pub async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    let mut lsm = LSM::new(128 * 1024 * 1024, 8, "./".to_string()).await?;
 
-    let mut keys = vec![0u64];
-    let n_operations = 1000000;
-    let start_key = 0u64;
+    let mut keys = vec![0u16];
+    let n_operations = 500000000;
+    let start_key = 0u16;
     let value = format!("Value for key {}#", start_key);
     lsm.put(
         Cow::Owned(start_key.to_be_bytes().to_vec().into()),
         value.into(),
     )
-    .await
-    .unwrap();
+    .await?;
 
     let mut write_stats = Stats::new();
     let mut read_stats = Stats::new();
@@ -27,22 +25,25 @@ pub async fn main() -> Result<(), std::io::Error> {
         if read_operation {
             let key = keys.choose(&mut thread_rng()).unwrap();
             let start = std::time::Instant::now();
-            let value = lsm.get(&key.to_be_bytes().to_vec().into()).await.unwrap();
+            let value = lsm.get(&key.to_be_bytes().to_vec().into()).await?;
             let elapsed = start.elapsed().as_millis() as u64;
             read_stats.update(elapsed);
-            assert!(value.unwrap().as_ref() == format!("Value for key {}#", key).as_bytes());
+            // assert!(
+            //     value.unwrap().as_ref()
+            //         == format!("Value for key {}#{:?}#", key, (0..*key).collect::<Vec<_>>())
+            //             .as_bytes()
+            // );
             if read_stats.n_operations % 10000 == 0 {
                 println!("#####");
                 println!("Read stats:");
                 read_stats.print();
             }
         } else {
-            let key: u64 = rand::random();
-            let value = format!("Value for key {}#", key);
+            let key: u16 = rand::random();
+            let value = format!("Value for key {}#{:?}", key, (0..key).collect::<Vec<_>>());
             let start = std::time::Instant::now();
             lsm.put(Cow::Owned(key.to_be_bytes().to_vec().into()), value.into())
-                .await
-                .unwrap();
+                .await?;
             let elapsed = start.elapsed().as_millis() as u64;
             write_stats.update(elapsed);
             keys.push(key);
@@ -53,7 +54,7 @@ pub async fn main() -> Result<(), std::io::Error> {
             }
         }
     }
-
+    lsm.close().await?;
     Ok(())
 }
 

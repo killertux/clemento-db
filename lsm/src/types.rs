@@ -1,6 +1,7 @@
 use std::ops::BitAnd;
 
 use bytes::{BufMut, BytesMut};
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,43 +110,58 @@ impl UVarInt {
 }
 
 impl TryInto<u8> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_into(self) -> Result<u8, Self::Error> {
         Ok(match self {
             UVarInt::U8(n) => n,
-            other => return Err(format!("Invalid coercion of VarInt {:?} to u8", other)),
+            other => {
+                return Err(UVartIntConvertError(format!(
+                    "Invalid coercion of VarInt {:?} to u8",
+                    other
+                )))
+            }
         })
     }
 }
 
 impl TryInto<u16> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_into(self) -> Result<u16, Self::Error> {
         Ok(match self {
             UVarInt::U8(n) => n.into(),
             UVarInt::U16(n) => n,
-            other => return Err(format!("Invalid coercion of VarInt {:?} to u16", other)),
+            other => {
+                return Err(UVartIntConvertError(format!(
+                    "Invalid coercion of VarInt {:?} to u16",
+                    other
+                )))
+            }
         })
     }
 }
 
 impl TryInto<u32> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_into(self) -> Result<u32, Self::Error> {
         Ok(match self {
             UVarInt::U8(n) => n.into(),
             UVarInt::U16(n) => n.into(),
             UVarInt::U32(n) => n,
-            other => return Err(format!("Invalid coercion of VarInt {:?} to u32", other)),
+            other => {
+                return Err(UVartIntConvertError(format!(
+                    "Invalid coercion of VarInt {:?} to u32",
+                    other
+                )))
+            }
         })
     }
 }
 
 impl TryInto<u64> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_into(self) -> Result<u64, Self::Error> {
         Ok(match self {
@@ -153,13 +169,18 @@ impl TryInto<u64> for UVarInt {
             UVarInt::U16(n) => n.into(),
             UVarInt::U32(n) => n.into(),
             UVarInt::U64(n) => n,
-            other => return Err(format!("Invalid coercion of VarInt {:?} to u64", other)),
+            other => {
+                return Err(UVartIntConvertError(format!(
+                    "Invalid coercion of VarInt {:?} to u64",
+                    other
+                )))
+            }
         })
     }
 }
 
 impl TryInto<u128> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_into(self) -> Result<u128, Self::Error> {
         Ok(match self {
@@ -173,7 +194,7 @@ impl TryInto<u128> for UVarInt {
 }
 
 impl TryInto<usize> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_into(self) -> Result<usize, Self::Error> {
         Ok(match self {
@@ -181,19 +202,19 @@ impl TryInto<usize> for UVarInt {
             UVarInt::U16(n) => n.into(),
             UVarInt::U32(n) => n
                 .try_into()
-                .map_err(|_| "Invalid coercion of u32 to usize")?,
+                .map_err(|_| UVartIntConvertError("Invalid coercion of u32 to usize".into()))?,
             UVarInt::U64(n) => n
                 .try_into()
-                .map_err(|_| "Invalid coercion of u64 to usize")?,
+                .map_err(|_| UVartIntConvertError("Invalid coercion of u64 to usize".into()))?,
             UVarInt::U128(n) => n
                 .try_into()
-                .map_err(|_| "Invalid coercion of u128 to usize")?,
+                .map_err(|_| UVartIntConvertError("Invalid coercion of u128 to usize".into()))?,
         })
     }
 }
 
 impl TryFrom<usize> for UVarInt {
-    type Error = String;
+    type Error = UVartIntConvertError;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
         u8::try_from(value)
@@ -202,9 +223,15 @@ impl TryFrom<usize> for UVarInt {
             .or_else(|_| u32::try_from(value).map(UVarInt::U32))
             .or_else(|_| u64::try_from(value).map(UVarInt::U64))
             .or_else(|_| u128::try_from(value).map(UVarInt::U128))
-            .map_err(|_| format!("Invalid coercion of usize {} to VarInt", value))
+            .map_err(|_| {
+                UVartIntConvertError(format!("Invalid coercion of usize {} to VarInt", value))
+            })
     }
 }
+
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct UVartIntConvertError(String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fixed28BitsInt(u32);
