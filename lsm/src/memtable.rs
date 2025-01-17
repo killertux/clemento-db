@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::BTreeMap};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -9,16 +9,16 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub(crate) struct Memtable {
+pub struct Memtable {
     size: usize,
-    data: Vec<(Key, Value)>,
+    data: BTreeMap<Key, Value>,
 }
 
 impl Memtable {
     pub fn new() -> Self {
         Self {
             size: 0,
-            data: vec![],
+            data: BTreeMap::new(),
         }
     }
 
@@ -28,34 +28,33 @@ impl Memtable {
             return;
         }
         let value_size = value.size();
-        match self.data.binary_search_by(|entry| entry.0.cmp(&key)) {
-            Ok(index) => {
-                let old_value_size = self.data[index].1.size();
-                self.data[index].1 = value;
+        match self.data.insert(key.into_owned(), value) {
+            Some(old) => {
+                let old_value_size = old.size();
                 self.size -= old_value_size;
                 self.size += value_size;
             }
-            Err(index) => {
+            None => {
                 self.size += key_size + value_size;
-                self.data.insert(index, (key.into_owned(), value))
             }
         }
     }
 
     pub fn get(&self, key: &Bytes) -> Option<&Value> {
         tracing::debug!("Searching for key: {:?} in memtable", key);
-        match self.data.binary_search_by(|entry| entry.0.cmp(key)) {
-            Ok(index) => Some(&self.data[index].1),
-            Err(_) => None,
-        }
+        self.data.get(key)
     }
 
     pub fn size(&self) -> usize {
         self.size
     }
 
-    pub fn data(&self) -> &[(Key, Value)] {
-        &self.data
+    pub fn iter(&self) -> impl Iterator<Item = (&Key, &Value)> {
+        self.data.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
     }
 
     pub async fn write<W>(&self, writer: &mut W) -> Result<(), WriteMemtableError>
@@ -95,11 +94,11 @@ impl Memtable {
             .await
             .map_err(ReadMemtableError::ReadSizeError)?
             .try_into()?;
-        let data_size = UVarInt::read(reader)
+        let data_size: u64 = UVarInt::read(reader)
             .await
             .map_err(ReadMemtableError::ReadDataSizeError)?
             .try_into()?;
-        let mut data = Vec::with_capacity(data_size);
+        let mut data = BTreeMap::new();
         for _ in 0..data_size {
             let key_size = UVarInt::read(reader)
                 .await
@@ -113,7 +112,7 @@ impl Memtable {
             let value = Value::read(reader)
                 .await
                 .map_err(ReadMemtableError::ReadValueError)?;
-            data.push((key.into(), value));
+            data.insert(key.into(), value);
         }
         Ok(Self { size, data })
     }
@@ -151,10 +150,10 @@ pub enum ReadMemtableError {
     ConvertError(#[from] UVartIntConvertError),
 }
 
-pub(crate) type Key = Bytes;
+pub type Key = Bytes;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum Value {
+pub enum Value {
     TombStone,
     Data(Bytes),
 }

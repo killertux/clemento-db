@@ -25,7 +25,7 @@ pub async fn main() -> anyhow::Result<()> {
         if read_operation {
             let key = keys.choose(&mut thread_rng()).unwrap();
             let start = std::time::Instant::now();
-            let value = lsm.get(&key.to_be_bytes().to_vec().into()).await?;
+            let _value = lsm.get(&key.to_be_bytes().to_vec().into()).await?;
             let elapsed = start.elapsed().as_millis() as u64;
             read_stats.update(elapsed);
             // assert!(

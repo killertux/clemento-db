@@ -19,42 +19,28 @@ use crate::{
     MapErrIntoOtherError,
 };
 
-pub struct SSTable {
-    metadata: SSTableMetadata,
-    data: Vec<(Key, Value)>,
-}
-
 const BLOOM_FILTER_FP: f64 = 0.1;
 
-impl SSTable {
-    pub fn try_from_memtable(
+impl SSTableMetadata {
+    pub async fn write_from_memtable(
         memtable: &Memtable,
+        base_path: &str,
         file_id: u64,
-    ) -> Result<Self, ErrorCreatingSSTable> {
-        let data = memtable.data();
-        let mut bloom_filter = Bloom::new_for_fp_rate(data.len(), BLOOM_FILTER_FP)
-            .map_err(ErrorCreatingSSTable::BloomFilterError)?;
-        data.iter().for_each(|entry| bloom_filter.set(&entry.0));
+    ) -> Result<Self, SaveSStableError> {
+        let n_entries = memtable.len();
+        let mut bloom_filter = Bloom::new_for_fp_rate(n_entries, BLOOM_FILTER_FP)
+            .map_err(|err| SaveSStableError::BloomFilter(err.into()))?;
+        memtable.iter().for_each(|entry| bloom_filter.set(entry.0));
         let metadata = SSTableMetadata {
             bloom_filter,
             level: 0,
             file_id,
-            n_entries: data.len() as u64,
+            n_entries: n_entries as u64,
         };
-        Ok(Self {
-            metadata,
-            data: data.to_vec(),
-        })
-    }
-
-    pub async fn store_and_return_metadata(
-        self,
-        base_path: &str,
-    ) -> Result<SSTableMetadata, SaveSStableError> {
         let mut keys_file = BufWriter::new(
             File::create(format!(
                 "{base_path}/{}_{:08}.sst_keys",
-                self.metadata.level, self.metadata.file_id
+                metadata.level, metadata.file_id
             ))
             .await
             .map_err(SaveSStableError::CreateKeysFile)?,
@@ -62,22 +48,22 @@ impl SSTable {
         let mut values_file = BufWriter::new(
             File::create(format!(
                 "{base_path}/{}_{:08}.sst_values",
-                self.metadata.level, self.metadata.file_id
+                metadata.level, metadata.file_id
             ))
             .await
             .map_err(SaveSStableError::CreateValuesFile)?,
         );
-        self.metadata
+        metadata
             .store(base_path)
             .await
             .map_err(SaveSStableError::SaveMetadata)?;
         let mut values_cursor: usize = 0;
-        for (key, value) in self.data {
+        for (key, value) in memtable.iter() {
             keys_file
                 .write_u8(0)
                 .await
                 .map_err(SaveSStableError::ErrorWritingSeparator)?;
-            let key = quote_null_bytes(key);
+            let key = quote_null_bytes(key.clone());
             let key_size = key.len();
             Fixed28BitsInt::new(key_size.try_into()?)
                 .write(&mut keys_file)
@@ -104,7 +90,7 @@ impl SSTable {
             .flush()
             .await
             .map_err(SaveSStableError::ErrorFlushinValuesFile)?;
-        Ok(self.metadata)
+        Ok(metadata)
     }
 
     pub async fn load_value(
@@ -327,7 +313,7 @@ impl SSTable {
             .await
             .map_err(SSTableCompactError::FlushValuesFile)?;
         let mut bloom_filter = Bloom::new_for_fp_rate(n_entries, BLOOM_FILTER_FP)
-            .map_err(ErrorCreatingSSTable::BloomFilterError)?;
+            .map_err(|err| SSTableCompactError::BloomFilter(err.into()))?;
         {
             let mut file = keys_file.into_inner();
             file.seek(SeekFrom::Start(0))
@@ -387,6 +373,8 @@ impl SSTable {
 
 #[derive(Debug, Error)]
 pub enum SaveSStableError {
+    #[error("Error creating bloom filter: {0}")]
+    BloomFilter(String),
     #[error("Error creating keys file: {0}")]
     CreateKeysFile(std::io::Error),
     #[error("Error creating values file: {0}")]
@@ -552,13 +540,9 @@ fn unquote_null_bytes(bytes: Bytes) -> Bytes {
 }
 
 #[derive(Debug, Error)]
-pub enum ErrorCreatingSSTable {
-    #[error("Error creating bloom filter: {0}")]
-    BloomFilterError(&'static str),
-}
-
-#[derive(Debug, Error)]
 pub enum SSTableCompactError {
+    #[error("Error creating bloom filter: {0}")]
+    BloomFilter(String),
     #[error("Error creating key value reader for metadata {0:?}: {1}")]
     CreateKeyValueReader(SSTableMetadata, std::io::Error),
     #[error("Error creating keys file: {0}")]
@@ -587,8 +571,6 @@ pub enum SSTableCompactError {
     ReadKey(std::io::Error),
     #[error("Error saveing metadata file: {0}")]
     SaveMetadata(std::io::Error),
-    #[error(transparent)]
-    ErrorCreatingSSTable(#[from] ErrorCreatingSSTable),
     #[error(transparent)]
     ConvertError(#[from] TryFromIntError),
 }
@@ -680,17 +662,19 @@ mod test {
         memtable.put(Cow::Borrowed(&key1), Value::Data(Bytes::from("value1")));
         memtable.put(Cow::Borrowed(&key2), Value::Data(Bytes::from("value2")));
         memtable.put(Cow::Borrowed(&key3), Value::Data(Bytes::from("value3")));
-        let sstable1 = SSTable::try_from_memtable(&memtable, 1).unwrap();
+        let metadata_1 = SSTableMetadata::write_from_memtable(&memtable, &base_path, 1)
+            .await
+            .unwrap();
         let mut memtable = Memtable::new();
         memtable.put(Cow::Borrowed(&key1), Value::Data(Bytes::from("value10")));
         memtable.put(Cow::Borrowed(&key2), Value::TombStone);
-        let sstable2 = SSTable::try_from_memtable(&memtable, 2).unwrap();
-        let metadata_1 = sstable1.store_and_return_metadata(base_path).await.unwrap();
-        let metadata_2 = sstable2.store_and_return_metadata(base_path).await.unwrap();
-        let metadata = SSTable::compact(&[metadata_1, metadata_2], base_path, 1, 3)
+        let metadata_2 = SSTableMetadata::write_from_memtable(&memtable, &base_path, 2)
             .await
             .unwrap();
-        let mut reader = SSTable::key_value_reader(base_path, &metadata)
+        let metadata = SSTableMetadata::compact(&[metadata_1, metadata_2], base_path, 1, 3)
+            .await
+            .unwrap();
+        let mut reader = SSTableMetadata::key_value_reader(base_path, &metadata)
             .await
             .unwrap();
         let (key, value) = reader.read().await.unwrap().unwrap();

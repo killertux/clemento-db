@@ -3,10 +3,7 @@ use std::{borrow::Cow, collections::HashMap, io::ErrorKind, sync::Arc};
 use bytes::Bytes;
 use flock::Flock;
 use memtable::{Memtable, ReadMemtableError, Value, WriteMemtableError};
-use sstable::{
-    ErrorCreatingSSTable, LoadSStableValueError, SSTable, SSTableCompactError, SSTableMetadata,
-    SaveSStableError,
-};
+use sstable::{LoadSStableValueError, SSTableCompactError, SSTableMetadata, SaveSStableError};
 use thiserror::Error;
 
 use tokio::{
@@ -158,11 +155,15 @@ impl LSM {
                                 for metadata in metadatas.iter().rev() {
                                     if metadata.check(key) {
                                         tracing::debug!("BloomFilter positive for key {key:?} in sstable {metadata:?}");
-                                        match SSTable::load_value(metadata, &self.base_path, key)
-                                            .await
-                                            .map_err(|err| {
-                                                LsmError::LoadSStableValueError(key.clone(), err)
-                                            })? {
+                                        match SSTableMetadata::load_value(
+                                            metadata,
+                                            &self.base_path,
+                                            key,
+                                        )
+                                        .await
+                                        .map_err(
+                                            |err| LsmError::LoadSStableValueError(key.clone(), err),
+                                        )? {
                                             Some(Value::TombStone) => return Ok(None),
                                             Some(Value::Data(value)) => {
                                                 return Ok(Some(value));
@@ -249,9 +250,12 @@ impl LSM {
                     tracing::debug!("Writing memtable to disk");
                     let (metadata, level) = {
                         let inner = inner.read().await;
-                        let sstable =
-                            SSTable::try_from_memtable(&inner.memtable, inner.n_sstables)?;
-                        let metadata = sstable.store_and_return_metadata(&base_path).await?;
+                        let metadata = SSTableMetadata::write_from_memtable(
+                            &inner.memtable,
+                            &base_path,
+                            inner.n_sstables,
+                        )
+                        .await?;
                         let level = metadata.level();
                         (metadata, level)
                     };
@@ -285,9 +289,10 @@ impl LSM {
                     let result = {
                         if let Some((metadatas, n_sstables)) = result {
                             tracing::debug!("Running compact for level {new_level}");
-                            let metadata =
-                                SSTable::compact(&metadatas, &base_path, new_level, n_sstables)
-                                    .await?;
+                            let metadata = SSTableMetadata::compact(
+                                &metadatas, &base_path, new_level, n_sstables,
+                            )
+                            .await?;
                             let mut paths_to_delete = Vec::new();
                             for metadata in metadatas {
                                 paths_to_delete.push(format!(
@@ -408,8 +413,6 @@ where
 
 #[derive(Debug, Error)]
 pub enum LsmError {
-    #[error("Error creating SSTable. `{0}`")]
-    ErrorCreatingSSTable(#[from] ErrorCreatingSSTable),
     #[error(transparent)]
     IoError(#[from] std::io::Error),
     #[error("Error compacting SSTable. `{0}`")]
