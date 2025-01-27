@@ -5,7 +5,7 @@ use std::borrow::Cow;
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let mut lsm = LSM::new(512 * 1024 * 1024, 4, "./".to_string()).await?;
+    let mut lsm = LSM::new(512 * 1024 * 1024, 4, "./".to_string(), false).await?;
 
     let mut keys = vec![0u16];
     let n_operations = 500000;

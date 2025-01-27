@@ -26,6 +26,7 @@ impl SSTableMetadata {
         memtable: &Memtable,
         base_path: &str,
         file_id: u64,
+        last_entry_id: u64,
     ) -> Result<Self, SaveSStableError> {
         let n_entries = memtable.len();
         let mut bloom_filter = Bloom::new_for_fp_rate(n_entries, BLOOM_FILTER_FP)
@@ -36,6 +37,7 @@ impl SSTableMetadata {
             level: 0,
             file_id,
             n_entries: n_entries as u64,
+            last_entry_id,
         };
         let mut keys_file = BufWriter::new(
             File::create(format!(
@@ -333,6 +335,7 @@ impl SSTableMetadata {
             level: new_level,
             file_id: new_file_id,
             n_entries: n_entries as u64,
+            last_entry_id: metadatas.iter().map(|m| m.last_entry_id).max().unwrap_or(0),
         };
         metadata
             .store(base_path)
@@ -581,9 +584,14 @@ pub struct SSTableMetadata {
     level: u8,
     file_id: u64,
     n_entries: u64,
+    last_entry_id: u64,
 }
 
 impl SSTableMetadata {
+    pub fn entry_id(&self) -> u64 {
+        self.last_entry_id
+    }
+
     pub fn level(&self) -> u8 {
         self.level
     }
@@ -613,6 +621,7 @@ impl SSTableMetadata {
         file.write_u8(self.level).await?;
         file.write_u64(self.file_id).await?;
         file.write_u64(self.n_entries).await?;
+        file.write_u64(self.last_entry_id).await?;
         file.flush().await
     }
 
@@ -626,11 +635,13 @@ impl SSTableMetadata {
         let level = file.read_u8().await?;
         let file_id = file.read_u64().await?;
         let n_entries = file.read_u64().await?;
+        let last_entry_id = file.read_u64().await?;
         Ok(Self {
             bloom_filter,
             level,
             file_id,
             n_entries,
+            last_entry_id,
         })
     }
 }
@@ -662,13 +673,13 @@ mod test {
         memtable.put(Cow::Borrowed(&key1), Value::Data(Bytes::from("value1")));
         memtable.put(Cow::Borrowed(&key2), Value::Data(Bytes::from("value2")));
         memtable.put(Cow::Borrowed(&key3), Value::Data(Bytes::from("value3")));
-        let metadata_1 = SSTableMetadata::write_from_memtable(&memtable, &base_path, 1)
+        let metadata_1 = SSTableMetadata::write_from_memtable(&memtable, &base_path, 1, 3)
             .await
             .unwrap();
         let mut memtable = Memtable::new();
         memtable.put(Cow::Borrowed(&key1), Value::Data(Bytes::from("value10")));
         memtable.put(Cow::Borrowed(&key2), Value::TombStone);
-        let metadata_2 = SSTableMetadata::write_from_memtable(&memtable, &base_path, 2)
+        let metadata_2 = SSTableMetadata::write_from_memtable(&memtable, &base_path, 2, 5)
             .await
             .unwrap();
         let metadata = SSTableMetadata::compact(&[metadata_1, metadata_2], base_path, 1, 3)

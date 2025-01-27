@@ -1,0 +1,16 @@
+[package]
+name = "kv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "io-util",
+    "rt-multi-thread",
+    "macros",
+    "net",
+] }
+tracing = "0.1"
+anyhow = "1"
+lsm = { path = "../lsm" }
+tracing-subscriber = "0.3.19"

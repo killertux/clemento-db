@@ -1,12 +1,8 @@
 use bytes::Bytes;
 use std::{borrow::Cow, collections::BTreeMap};
-use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{
-    types::{UVarInt, UVartIntConvertError},
-    MapErrIntoOtherError,
-};
+use crate::{types::UVarInt, MapErrIntoOtherError};
 
 #[derive(Debug)]
 pub struct Memtable {
@@ -24,9 +20,6 @@ impl Memtable {
 
     pub fn put(&mut self, key: Cow<'_, Bytes>, value: Value) {
         let key_size = key.len();
-        if key_size == 0 {
-            return;
-        }
         let value_size = value.size();
         match self.data.insert(key.into_owned(), value) {
             Some(old) => {
@@ -56,98 +49,6 @@ impl Memtable {
     pub fn len(&self) -> usize {
         self.data.len()
     }
-
-    pub async fn write<W>(&self, writer: &mut W) -> Result<(), WriteMemtableError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        UVarInt::try_from(self.size)?
-            .write(writer)
-            .await
-            .map_err(WriteMemtableError::WriteSizeError)?;
-        UVarInt::try_from(self.data.len())?
-            .write(writer)
-            .await
-            .map_err(WriteMemtableError::WriteDataSizeError)?;
-        for (key, value) in self.data.iter() {
-            UVarInt::try_from(key.len())?
-                .write(writer)
-                .await
-                .map_err(WriteMemtableError::WriteKeySizeError)?;
-            writer
-                .write_all(key)
-                .await
-                .map_err(WriteMemtableError::WriteKeyError)?;
-            value
-                .write(writer)
-                .await
-                .map_err(WriteMemtableError::WriteValueError)?;
-        }
-        Ok(())
-    }
-
-    pub async fn read<R>(reader: &mut R) -> Result<Self, ReadMemtableError>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let size = UVarInt::read(reader)
-            .await
-            .map_err(ReadMemtableError::ReadSizeError)?
-            .try_into()?;
-        let data_size: u64 = UVarInt::read(reader)
-            .await
-            .map_err(ReadMemtableError::ReadDataSizeError)?
-            .try_into()?;
-        let mut data = BTreeMap::new();
-        for _ in 0..data_size {
-            let key_size = UVarInt::read(reader)
-                .await
-                .map_err(ReadMemtableError::ReadKeySizeError)?
-                .try_into()?;
-            let mut key = vec![0; key_size];
-            reader
-                .read_exact(&mut key)
-                .await
-                .map_err(ReadMemtableError::ReadKeyError)?;
-            let value = Value::read(reader)
-                .await
-                .map_err(ReadMemtableError::ReadValueError)?;
-            data.insert(key.into(), value);
-        }
-        Ok(Self { size, data })
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum WriteMemtableError {
-    #[error("Error writing memtable size: `{0}`")]
-    WriteSizeError(std::io::Error),
-    #[error("Error writing memtable data size: `{0}`")]
-    WriteDataSizeError(std::io::Error),
-    #[error("Error writing key size: `{0}`")]
-    WriteKeySizeError(std::io::Error),
-    #[error("Error writing key: `{0}`")]
-    WriteKeyError(std::io::Error),
-    #[error("Error writing value: `{0}`")]
-    WriteValueError(std::io::Error),
-    #[error(transparent)]
-    ConvertError(#[from] UVartIntConvertError),
-}
-
-#[derive(Debug, Error)]
-pub enum ReadMemtableError {
-    #[error("Error reading memtable size: `{0}`")]
-    ReadSizeError(std::io::Error),
-    #[error("Error reading memtable data size: `{0}`")]
-    ReadDataSizeError(std::io::Error),
-    #[error("Error reading key size: `{0}`")]
-    ReadKeySizeError(std::io::Error),
-    #[error("Error reading key: `{0}`")]
-    ReadKeyError(std::io::Error),
-    #[error("Error reading value: `{0}`")]
-    ReadValueError(std::io::Error),
-    #[error(transparent)]
-    ConvertError(#[from] UVartIntConvertError),
 }
 
 pub type Key = Bytes;
